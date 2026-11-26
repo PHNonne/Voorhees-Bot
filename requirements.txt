@@ -1,0 +1,8 @@
+aiohttp==3.13.3
+discord.py==2.7.1
+gTTS==2.5.4
+google-genai
+protobuf==7.34.1
+python-dotenv==1.2.2
+Requests==2.33.1
+yt_dlp==2026.3.17
