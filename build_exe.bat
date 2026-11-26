@@ -9,6 +9,11 @@ python -m PyInstaller --noconfirm --onefile --console --name Voorhees ^
   --collect-data gtts ^
   --collect-data tzdata ^
   Voorhees.py
+if errorlevel 1 (
+  echo Build that bai.
+  pause
+  exit /b 1
+)
 echo.
 echo File exe: %~dp0dist\Voorhees.exe
 pause
