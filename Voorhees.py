@@ -16,21 +16,44 @@ from zoneinfo import ZoneInfo
 import time
 import sys
 
-if getattr(sys, "frozen", False):
+if getattr(sys, 'frozen', False):
     BASE_DIR = os.path.dirname(sys.executable)
+    _MEIPASS = sys._MEIPASS
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-os.chdir(BASE_DIR)
-for _stream in (sys.stdout, sys.stderr):
-    if _stream and hasattr(_stream, "reconfigure"):
-        _stream.reconfigure(encoding="utf-8", errors="replace")
-_local_ffmpeg = os.path.join(BASE_DIR, "ffmpeg.exe")
-FFMPEG_EXE = _local_ffmpeg if os.path.exists(_local_ffmpeg) else "ffmpeg"
+    _MEIPASS = os.path.dirname(os.path.abspath(__file__))
+
+sys.path.append(os.path.join(_MEIPASS, "modules"))
+import tts_piper
+
+# Force PyInstaller to include PyNaCl for discord.py voice support
+try:
+    import nacl.secret
+    import nacl.utils
+except ImportError:
+    pass
+
+FFMPEG_EXECUTABLE = r"C:\BotDiscord\ffmpeg\bin\ffmpeg.exe"
+print(f"[FFMPEG] Using executable: {FFMPEG_EXECUTABLE}")
+
+# yt-dlp executable
+YTDLP_EXECUTABLE = r"C:\BotDiscord\yt-dlp\yt-dlp.exe"
+print(f"[YTDLP] Using executable: {YTDLP_EXECUTABLE}")
+
+# Music cache directory
+MUSIC_CACHE_DIR = os.path.join(BASE_DIR, "music_cache")
+os.makedirs(MUSIC_CACHE_DIR, exist_ok=True)
+print(f"[MUSIC CACHE] Directory: {MUSIC_CACHE_DIR}")
+
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 BLACKLIST_FILE = os.path.join(BASE_DIR, "blacklist_words.txt")
 STEAM_LINKS_FILE = os.path.join(BASE_DIR, "steam_links.json")
 INACTIVE_CHECK_FILE = os.path.join(BASE_DIR, "inactive_check.json")
 USER_ACTIVITY_FILE = os.path.join(BASE_DIR, "user_activity.json")
+REMOVED_REACTIONS_FILE = os.path.join(BASE_DIR, "removed_reactions.json")
+BOT_CHANNEL_STATE_FILE = os.path.join(BASE_DIR, "bot_channel_state.json")  # Voice-restricted state
+BOT_CHANNEL_ORIGINAL_STATE_FILE = os.path.join(BASE_DIR, "bot_channel_original_state.json")  # Original state
+VOICE_SETTINGS_FILE = os.path.join(BASE_DIR, "voice_settings.json")  # Voice settings for talkgoogle/talkvoice
 
 auto_disconnect_tasks: dict[int, asyncio.Task] = {}
 dm_sessions: dict[int, dict] = {}
@@ -40,6 +63,23 @@ MAX_PROCESSED_MESSAGE_IDS = 1000
 
 WELCOME_CHANNEL_ID = 1407054815611326464  # kênh chào mừng
 GOODBYE_CHANNEL_ID = 1454875824128790558  # kênh tạm biệt
+kicked_banned_users = set()
+
+# ================== JAIL SYSTEM CONSTANTS ==================
+JAIL_ROLE_ID = 1452981971905937460  # Role tù nhân
+JAIL_CHANNEL_ID = 1530809091385987163  # Kênh chat nhà tù
+JAIL_ADMIN_ROLE_ID = 1407045564964536500  # Role admin được phép dùng lệnh jail/unjail
+JAIL_STATE_FILE = os.path.join(BASE_DIR, "jail_state.json")  # File lưu trạng thái tù nhân
+JAIL_SPAM_DELAY = 15.0  # Delay (giây) giữa các lần spam keyword hợp lệ
+
+# ================== SPAM FILTER CONSTANTS ==================
+DECLARE_MESSAGE_ID = 1465050575589605407  # Tin nhắn khai báo role
+DECLARE_CHANNEL_ID = 1465050026215477428  # Kênh khai báo role
+SPAM_FILTER_CHANNEL_ID = 1536384115769614446  # Kênh lọc spam (cấm chat)
+WARNING_CHANNEL_ID = 1536384115769614446  # Kênh cảnh báo spam
+AFFECTED_TEXT_CHANNELS = [1530019951031877783, 1454830895453442089, 1459632136201175398, 1399701361469165669]  # Các kênh text bị dính spam
+AFFECTED_VOICE_CHANNELS = [1530147183670595634, 1452964269334200330, 1399701317080846390]  # Các kênh voice bị dính spam
+WARNING_MESSAGE_FILE = os.path.join(BASE_DIR, "warning_message_state.json")  # File lưu trạng thái tin nhắn cảnh báo
 
 BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 GUILD_ID=1399701316573597797
@@ -62,6 +102,48 @@ class MyClient(discord.Client):
 
 client = MyClient()
 
+async def setup_spam_warning_message(guild):
+    """Thiết lập tin nhắn cảnh báo spam - chỉ gửi 1 lần duy nhất"""
+    try:
+        warning_channel = guild.get_channel(WARNING_CHANNEL_ID)
+        if not warning_channel:
+            print("[SPAM WARNING] Không tìm thấy kênh cảnh báo")
+            return
+
+        # Load trạng thái tin nhắn cảnh báo
+        try:
+            with open(WARNING_MESSAGE_FILE, "r", encoding="utf-8") as f:
+                warning_state = json.load(f)
+        except Exception:
+            warning_state = {}
+
+        # Kiểm tra xem tin nhắn cảnh báo đã tồn tại chưa
+        if warning_state.get("message_id"):
+            try:
+                await warning_channel.fetch_message(warning_state["message_id"])
+                print("[SPAM WARNING] Tin nhắn cảnh báo đã tồn tại, không cần gửi lại")
+                return
+            except discord.NotFound:
+                print("[SPAM WARNING] Tin nhắn cảnh báo cũ đã bị xóa, sẽ gửi lại")
+            except Exception as e:
+                print(f"[SPAM WARNING] Lỗi kiểm tra tin nhắn cũ: {e}")
+
+        # Gửi tin nhắn cảnh báo mới
+        warning_msg = await warning_channel.send(
+            "⚠️ **CẢNH BÁO SPAM** ⚠️\n\n"
+            "Đừng gửi tin nhắn vào kênh này nếu không muốn bị mất hết role/áo!\n"
+            "Kênh này được dùng để lọc spam, bất kỳ ai chat vào đây sẽ bị xóa role ngay lập tức."
+        )
+
+        # Lưu ID tin nhắn cảnh báo
+        warning_state["message_id"] = warning_msg.id
+        with open(WARNING_MESSAGE_FILE, "w", encoding="utf-8") as f:
+            json.dump(warning_state, f, indent=4)
+
+        print("[SPAM WARNING] Đã gửi tin nhắn cảnh báo spam")
+    except Exception as e:
+        print(f"[SPAM WARNING] Lỗi thiết lập tin nhắn cảnh báo: {e}")
+
 @client.event
 async def on_ready():
     print(f"🤖 Bot đăng nhập thành công: {client.user}")
@@ -70,6 +152,14 @@ async def on_ready():
     # Khởi động vòng lặp theo dõi Steam nickname
     if not track_steam_nicknames.is_running():
         track_steam_nicknames.start()
+
+    # Khởi động vòng lặp kiểm tra trùng role
+    if not check_duplicate_roles.is_running():
+        check_duplicate_roles.start()
+
+    # Khởi động vòng lặp cleanup music cache
+    if not cleanup_music_cache.is_running():
+        cleanup_music_cache.start()
 
     try:
         await setup_declare_message()
@@ -82,6 +172,15 @@ async def on_ready():
     if not guild:
         print("❌ Không tìm thấy guild")
         return
+
+    # ================== 3️⃣ RESTORE BOT CHANNEL ORIGINAL STATE ==================
+    try:
+        # Chỉ khôi phục nếu file tồn tại (tức là bot tắt đột ngột khi đang trong voice)
+        if os.path.exists(BOT_CHANNEL_ORIGINAL_STATE_FILE):
+            await restore_original_bot_channel_state(guild)
+            print("[BOT CHANNEL] Khôi phục kênh chat thành công sau khi restart")
+    except Exception as e:
+        print(f"[BOT CHANNEL] Error during original state restoration: {e}")
 
     state = load_ai_state()
 
@@ -99,6 +198,9 @@ async def on_ready():
 
     # Khởi chạy welcome bù
     await check_missed_welcomes(guild)
+
+    # ================== 4️⃣ SPAM FILTER WARNING MESSAGE ==================
+    await setup_spam_warning_message(guild)
 
 @client.event 
 async def on_message(message: discord.Message):
@@ -119,6 +221,129 @@ async def on_message(message: discord.Message):
     if isinstance(message.channel, discord.DMChannel):
         await handle_dm_reply(message)
         return
+
+    # Handle !voice and !google commands
+    if message.channel.id == 1454830895453442089:
+        content = message.content.strip()
+        
+        if content.startswith("!voice "):
+            await handle_voice_command(message, content[7:])
+            return
+        elif content.startswith("!google "):
+            await handle_google_command(message, content[8:])
+            return
+
+    # ================== SPAM FILTER ==================
+    if message.channel.id == SPAM_FILTER_CHANNEL_ID:
+        try:
+            # Xóa reaction của người spam khỏi tin nhắn khai báo
+            declare_channel = message.guild.get_channel(DECLARE_CHANNEL_ID)
+            if declare_channel:
+                try:
+                    declare_msg = await declare_channel.fetch_message(DECLARE_MESSAGE_ID)
+                    for reaction in declare_msg.reactions:
+                        async for user in reaction.users():
+                            if user.id == message.author.id:
+                                try:
+                                    await declare_msg.remove_reaction(reaction.emoji, message.author)
+                                    print(f"[SPAM FILTER] Đã xóa reaction của {message.author.name} khỏi tin nhắn khai báo")
+                                except Exception as e:
+                                    print(f"[SPAM FILTER] Lỗi xóa reaction: {e}")
+                except Exception as e:
+                    print(f"[SPAM FILTER] Lỗi lấy tin nhắn khai báo: {e}")
+            
+            # Xóa tin nhắn spam của người đó từ các kênh bị ảnh hưởng
+            all_affected_channels = AFFECTED_TEXT_CHANNELS + AFFECTED_VOICE_CHANNELS
+            for channel_id in all_affected_channels:
+                channel = message.guild.get_channel(channel_id)
+                if channel:
+                    try:
+                        async for msg in channel.history(limit=100):
+                            if msg.author.id == message.author.id:
+                                try:
+                                    await msg.delete()
+                                    print(f"[SPAM FILTER] Đã xóa tin nhắn của {message.author.name} từ kênh {channel.name}")
+                                except Exception:
+                                    continue
+                    except Exception as e:
+                        print(f"[SPAM FILTER] Lỗi xóa tin nhắn từ kênh {channel_id}: {e}")
+            
+            # Xóa tin nhắn spam vừa gửi trong kênh lọc
+            await message.delete()
+            print(f"[SPAM FILTER] Đã xóa tin nhắn spam của {message.author.name} từ kênh lọc")
+        except Exception as e:
+            print(f"[SPAM FILTER] Lỗi xử lý spam: {e}")
+        return
+
+    # ================== JAIL SYSTEM KEYWORD DETECTION ==================
+    if message.channel.id == JAIL_CHANNEL_ID:
+        jail_state = load_jail_state()
+        user_id_str = str(message.author.id)
+        
+        if user_id_str in jail_state:
+            user_data = jail_state[user_id_str]
+            keyword = user_data["keyword"]
+            required_count = user_data["required_count"]
+            current_count = user_data["current_count"]
+            last_spam_time = user_data["last_spam_time"]
+            
+            current_time = time.time()
+            time_since_last_spam = current_time - last_spam_time
+            
+            # Kiểm tra từ khóa
+            if message.content.strip() == keyword:
+                # Kiểm tra delay
+                if time_since_last_spam >= JAIL_SPAM_DELAY:
+                    # Spam hợp lệ
+                    user_data["current_count"] = current_count + 1
+                    user_data["last_spam_time"] = current_time
+                    remaining = required_count - user_data["current_count"]
+                    
+                    if remaining <= 0:
+                        # Đủ số lần spam - thả tù nhân
+                        try:
+                            # Khôi phục role cũ
+                            old_roles = user_data["old_roles"]
+                            for role_id in old_roles:
+                                role = message.guild.get_role(role_id)
+                                if role:
+                                    await message.author.add_roles(role)
+                            
+                            # Xóa role tù nhân
+                            jail_role = message.guild.get_role(JAIL_ROLE_ID)
+                            if jail_role:
+                                await message.author.remove_roles(jail_role)
+                            
+                            # Xóa toàn bộ tin nhắn trong kênh nhà tù
+                            async for msg in message.channel.history(limit=None):
+                                try:
+                                    await msg.delete()
+                                except Exception:
+                                    pass
+                            
+                            # Xóa khỏi jail state
+                            del jail_state[user_id_str]
+                            save_jail_state(jail_state)
+                            
+                            print(f"[JAIL] {message.author.id} đã hoàn thành hình phạt")
+                        except Exception as e:
+                            print(f"[JAIL] Lỗi khi thả tù nhân tự động: {e}")
+                    else:
+                        # Còn thiếu - thông báo số lượng còn lại
+                        bot_msg = await message.channel.send(f"✅ Đã ghi nhận. Cần spam thêm {remaining} lần.")
+                        user_data["bot_messages"].append(bot_msg.id)
+                        save_jail_state(jail_state)
+                        print(f"[JAIL] {message.author.id} spam hợp lệ - còn lại {remaining}")
+                else:
+                    # Spam quá nhanh
+                    remaining = required_count - current_count
+                    await message.channel.send(f"⏱️ Spam quá nhanh! Cần đợi {JAIL_SPAM_DELAY - time_since_last_spam:.1f} giây nữa. Còn thiếu {remaining} lần.")
+                    print(f"[JAIL] {message.author.id} spam quá nhanh")
+            else:
+                # Từ khóa sai
+                remaining = required_count - current_count
+                await message.channel.send(f"❌ Từ khóa sai! Cần spam `{keyword}`. Còn thiếu {remaining} lần.")
+                print(f"[JAIL] {message.author.id} spam từ khóa sai")
 
     await handle_ai_message(message)
 
@@ -147,6 +372,452 @@ def load_inactive_check():
 def save_inactive_check(data):
     with open(INACTIVE_CHECK_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4)
+
+def load_removed_reactions():
+    if not os.path.exists(REMOVED_REACTIONS_FILE):
+        return []
+    try:
+        with open(REMOVED_REACTIONS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def save_removed_reactions(data):
+    with open(REMOVED_REACTIONS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4)
+
+def load_voice_settings():
+    if not os.path.exists(VOICE_SETTINGS_FILE):
+        return {"google": {"language": None}, "voice": {"language": None, "voice": None}}
+    try:
+        with open(VOICE_SETTINGS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"google": {"language": None}, "voice": {"language": None, "voice": None}}
+
+def save_voice_settings(data):
+    with open(VOICE_SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4)
+
+async def handle_voice_command(message: discord.Message, text: str):
+    """Handle !voice command for Piper TTS"""
+    voice_settings = load_voice_settings()
+    
+    if not voice_settings["voice"]["language"] or not voice_settings["voice"]["voice"]:
+        await message.channel.send("❌ Chưa cài đặt giọng. Hãy dùng `/talkvoice` trước.", delete_after=10)
+        return
+    
+    language = voice_settings["voice"]["language"]
+    voice = voice_settings["voice"]["voice"]
+    
+    if not message.author.voice or not message.author.voice.channel:
+        await message.channel.send("❌ Bạn phải vào voice channel trước.", delete_after=10)
+        return
+    
+    guild_id = message.guild.id
+    if guild_id in music_playing or guild_id in tts_playing:
+        await message.channel.send("❌ Bot đang phát nhạc hoặc đọc TTS.", delete_after=20)
+        try:
+            await message.delete(delay=20)
+        except Exception:
+            pass
+        return
+    
+    voice_channel = message.author.voice.channel
+    vc = discord.utils.get(client.voice_clients, guild=message.guild)
+    
+    try:
+        if not vc or not vc.is_connected():
+            vc = await voice_channel.connect()
+        elif vc.channel != voice_channel:
+            await vc.move_to(voice_channel)
+    except Exception as e:
+        print(f"[!voice] Lỗi kết nối voice: {e}")
+        await message.channel.send("❌ Lỗi kết nối voice.", delete_after=10)
+        return
+    
+    # Tạo file TTS bằng Piper
+    def create_piper_tts():
+        try:
+            filename = tts_piper.generate_voice(language, voice, text)
+            return filename
+        except Exception as e:
+            print(f"[!voice] Lỗi khi tạo TTS: {e}")
+            raise
+    
+    try:
+        filename = await asyncio.to_thread(create_piper_tts)
+    except Exception as e:
+        await message.channel.send(f"❌ Lỗi khi tạo âm thanh: {str(e)}", delete_after=10)
+        return
+    
+    tts_playing.add(guild_id)
+    
+    # Gửi embed công khai
+    embed = discord.Embed(
+        title="🔊 Piper TTS",
+        color=discord.Color.green(),
+        description=f"**[{language.upper()}] [{voice}]** {text}"
+    )
+    embed.set_author(
+        name=f"{message.author.display_name} đã nói:",
+        icon_url=message.author.display_avatar.url
+    )
+    
+    msg = await message.channel.send(embed=embed)
+    pending_talkvoice_messages.add(msg)
+    pending_talkvoice_messages.add(message)
+    
+    async def schedule_delete(m, user_msg):
+        await asyncio.sleep(20)
+        if m in pending_talkvoice_messages:
+            try:
+                await m.delete()
+            except Exception:
+                pass
+            pending_talkvoice_messages.discard(m)
+        if user_msg in pending_talkvoice_messages:
+            try:
+                await user_msg.delete()
+            except Exception:
+                pass
+            pending_talkvoice_messages.discard(user_msg)
+    
+    asyncio.create_task(schedule_delete(msg, message))
+    
+    print(f"[!voice] File to play: {filename}")
+    print(f"[!voice] File exists: {os.path.exists(filename)}")
+    print(f"[!voice] FFmpeg executable: {FFMPEG_EXECUTABLE}")
+    print(f"[!voice] VC object: {vc}")
+    print(f"[!voice] VC is connected: {vc.is_connected() if vc else 'N/A'}")
+    
+    try:
+        print("[!voice] Creating FFmpegPCMAudio source...")
+        source = discord.FFmpegPCMAudio(executable=FFMPEG_EXECUTABLE, source=filename)
+        print(f"[!voice] Source created: {source}")
+        
+        print("[!voice] Calling vc.play()...")
+        vc.play(source)
+        print(f"[!voice] vc.play() called, is_playing: {vc.is_playing()}")
+        
+        while vc.is_playing():
+            await asyncio.sleep(1)
+        print("[!voice] Finished playing")
+        await asyncio.sleep(1)
+    except Exception as e:
+        print(f"[!voice] Error playing audio: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        if os.path.exists(filename):
+            try:
+                tts_piper.cleanup_audio_file(filename)
+            except Exception as e:
+                print(f"[!voice] Cannot remove {filename}: {e}")
+        tts_playing.discard(guild_id)
+
+async def handle_google_command(message: discord.Message, text: str):
+    """Handle !google command for Google TTS"""
+    voice_settings = load_voice_settings()
+    
+    if not voice_settings["google"]["language"]:
+        await message.channel.send("❌ Chưa cài đặt ngôn ngữ. Hãy dùng `/talkgoogle` trước.", delete_after=10)
+        return
+    
+    lang = voice_settings["google"]["language"]
+    
+    if not message.author.voice or not message.author.voice.channel:
+        await message.channel.send("❌ Bạn phải vào voice channel trước.", delete_after=10)
+        return
+    
+    guild_id = message.guild.id
+    if guild_id in music_playing or guild_id in tts_playing:
+        await message.channel.send("❌ Bot đang phát nhạc hoặc đọc TTS.", delete_after=20)
+        try:
+            await message.delete(delay=20)
+        except Exception:
+            pass
+        return
+    
+    voice_channel = message.author.voice.channel
+    vc = discord.utils.get(client.voice_clients, guild=message.guild)
+    
+    try:
+        if not vc or not vc.is_connected():
+            vc = await voice_channel.connect()
+        elif vc.channel != voice_channel:
+            await vc.move_to(voice_channel)
+    except Exception as e:
+        print(f"[!google] Lỗi kết nối voice: {e}")
+        await message.channel.send("❌ Lỗi kết nối voice.", delete_after=10)
+        return
+    
+    # Tạo file TTS
+    def create_tts():
+        try:
+            tts = gTTS(text=text, lang=lang)
+            fname = f"voice_{message.author.id}_{int(time.time() * 1000)}.mp3"
+            tts.save(fname)
+            return fname
+        except Exception as e:
+            print(f"[!google] Lỗi khi tạo TTS: {e}")
+            raise
+    
+    try:
+        filename = await asyncio.to_thread(create_tts)
+    except Exception:
+        await message.channel.send(f"❌ Ngôn ngữ `{lang}` không được hỗ trợ.", delete_after=10)
+        return
+    
+    tts_playing.add(guild_id)
+    
+    # Gửi embed công khai
+    embed = discord.Embed(
+        title="🔊 Google TTS",
+        color=discord.Color.blue(),
+        description=f"**[{lang.upper()}]** {text}"
+    )
+    embed.set_author(
+        name=f"{message.author.display_name} đã nói:",
+        icon_url=message.author.display_avatar.url
+    )
+    
+    msg = await message.channel.send(embed=embed)
+    pending_talkgoogle_messages.add(msg)
+    pending_talkgoogle_messages.add(message)
+    
+    async def schedule_delete(m, user_msg):
+        await asyncio.sleep(20)
+        if m in pending_talkgoogle_messages:
+            try:
+                await m.delete()
+            except Exception:
+                pass
+            pending_talkgoogle_messages.discard(m)
+        if user_msg in pending_talkgoogle_messages:
+            try:
+                await user_msg.delete()
+            except Exception:
+                pass
+            pending_talkgoogle_messages.discard(user_msg)
+    
+    asyncio.create_task(schedule_delete(msg, message))
+    
+    print(f"[!google] File to play: {filename}")
+    print(f"[!google] File exists: {os.path.exists(filename)}")
+    print(f"[!google] FFmpeg executable: {FFMPEG_EXECUTABLE}")
+    print(f"[!google] VC object: {vc}")
+    print(f"[!google] VC is connected: {vc.is_connected() if vc else 'N/A'}")
+    
+    try:
+        print("[!google] Creating FFmpegPCMAudio source...")
+        source = discord.FFmpegPCMAudio(executable=FFMPEG_EXECUTABLE, source=filename)
+        print(f"[!google] Source created: {source}")
+        
+        print("[!google] Calling vc.play()...")
+        vc.play(source)
+        print(f"[!google] vc.play() called, is_playing: {vc.is_playing()}")
+        
+        while vc.is_playing():
+            await asyncio.sleep(1)
+        print("[!google] Finished playing")
+        await asyncio.sleep(1)
+    except Exception as e:
+        print(f"[!google] Error playing audio: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        if os.path.exists(filename):
+            try:
+                os.remove(filename)
+            except Exception as e:
+                print(f"[!google] Cannot remove {filename}: {e}")
+        tts_playing.discard(guild_id)
+
+def load_bot_channel_state():
+    """Load bot channel overwrites state from JSON file"""
+    if not os.path.exists(BOT_CHANNEL_STATE_FILE):
+        return {}
+    try:
+        with open(BOT_CHANNEL_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_bot_channel_state(overwrites: dict):
+    """Save bot channel overwrites state to JSON file"""
+    # Convert PermissionOverwrite objects to serializable format
+    serializable = {}
+    for target, overwrite in overwrites.items():
+        if isinstance(target, discord.Role):
+            key = f"role_{target.id}"
+        elif isinstance(target, discord.Member):
+            key = f"member_{target.id}"
+        else:
+            continue
+        
+        serializable[key] = {
+            "type": "role" if isinstance(target, discord.Role) else "member",
+            "id": target.id,
+            "allow": overwrite.pair()[0].value,
+            "deny": overwrite.pair()[1].value
+        }
+    
+    with open(BOT_CHANNEL_STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(serializable, f, indent=4)
+
+async def restore_bot_channel_state(guild: discord.Guild):
+    """Restore bot channel overwrites from saved voice state"""
+    state = load_bot_channel_state()
+    if not state:
+        print("[BOT CHANNEL] No saved voice state found")
+        return
+    
+    bot_channel = guild.get_channel(1454830895453442089)
+    if not bot_channel:
+        print("[BOT CHANNEL] Bot channel not found")
+        return
+    
+    try:
+        new_overwrites = {}
+        for key, data in state.items():
+            target_id = data["id"]
+            allow = discord.Permissions(data["allow"])
+            deny = discord.Permissions(data["deny"])
+            
+            if data["type"] == "role":
+                target = guild.get_role(target_id)
+            else:
+                target = guild.get_member(target_id)
+            
+            if target:
+                new_overwrites[target] = discord.PermissionOverwrite(
+                    allow=allow,
+                    deny=deny
+                )
+        
+        await bot_channel.edit(overwrites=new_overwrites)
+        print(f"[BOT CHANNEL] Restored voice state with {len(new_overwrites)} overwrites")
+    except Exception as e:
+        print(f"[BOT CHANNEL] Error restoring voice state: {e}")
+
+def save_original_bot_channel_state(overwrites: dict):
+    """Save original bot channel overwrites state to JSON file"""
+    # Convert PermissionOverwrite objects to serializable format
+    serializable = {}
+    for target, overwrite in overwrites.items():
+        if isinstance(target, discord.Role):
+            key = f"role_{target.id}"
+        elif isinstance(target, discord.Member):
+            key = f"member_{target.id}"
+        else:
+            continue
+        
+        serializable[key] = {
+            "type": "role" if isinstance(target, discord.Role) else "member",
+            "id": target.id,
+            "allow": overwrite.pair()[0].value,
+            "deny": overwrite.pair()[1].value
+        }
+    
+    with open(BOT_CHANNEL_ORIGINAL_STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(serializable, f, indent=4)
+
+def load_original_bot_channel_state():
+    """Load original bot channel overwrites state from JSON file"""
+    if not os.path.exists(BOT_CHANNEL_ORIGINAL_STATE_FILE):
+        return {}
+    try:
+        with open(BOT_CHANNEL_ORIGINAL_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+# ================== JAIL SYSTEM STATE FUNCTIONS ==================
+def save_jail_state(state: dict):
+    """Save jail state to JSON file"""
+    with open(JAIL_STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=4)
+
+def load_jail_state():
+    """Load jail state from JSON file"""
+    if not os.path.exists(JAIL_STATE_FILE):
+        return {}
+    try:
+        with open(JAIL_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+async def restore_original_bot_channel_state(guild: discord.Guild):
+    """Restore bot channel overwrites with a hardcoded Admin sequence"""
+    bot_channel = guild.get_channel(1454830895453442089)
+    if not bot_channel:
+        print("[BOT CHANNEL] Bot channel not found")
+        return
+    
+    try:
+        new_overwrites = dict(bot_channel.overwrites)
+        
+        # 1. Xóa hết tất cả Members trong overrides (ngoại trừ chủ server)
+        for target in list(new_overwrites.keys()):
+            if isinstance(target, discord.Member):
+                if target.id != guild.owner_id:
+                    del new_overwrites[target]
+                    
+        # 2. Thêm Role có ID 1407269404890370120 và cho phép View, Send, Read History
+        target_role = guild.get_role(1407269404890370120)
+        if target_role:
+            new_overwrites[target_role] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True
+            )
+            
+        await bot_channel.edit(overwrites=new_overwrites)
+        print(f"[BOT CHANNEL] Restored original state with hardcoded Admin process")
+        
+        # Xóa file backup (dùng như cờ đánh dấu) và clear bộ nhớ tạm sau khi khôi phục thành công
+        bot_channel_original_overwrites.clear()
+        try:
+            if os.path.exists(BOT_CHANNEL_ORIGINAL_STATE_FILE):
+                os.remove(BOT_CHANNEL_ORIGINAL_STATE_FILE)
+                print("[BOT CHANNEL] Deleted original state file after successful restore")
+        except Exception as e:
+            pass
+            
+    except Exception as e:
+        print(f"[BOT CHANNEL] Error restoring original state: {e}")
+
+async def remove_declare_reactions(member: discord.Member):
+    """Xóa reactions của user khỏi tin nhắn declare và lưu ID vào file"""
+    guild = member.guild
+    declare_channel = guild.get_channel(1465050026215477428)
+    if not declare_channel:
+        return
+    
+    try:
+        target_msg = await declare_channel.fetch_message(1465050575589605407)
+        valid_emojis = {EMOJI_VIET_ID, EMOJI_NON_VIET_ID}
+        
+        for reaction in target_msg.reactions:
+            if hasattr(reaction.emoji, "id") and reaction.emoji.id in valid_emojis:
+                async for user in reaction.users():
+                    if user.id == member.id:
+                        await target_msg.remove_reaction(reaction.emoji, user)
+                        print(f"[DECLARE] Đã xóa reaction của {member.name} ({member.id})")
+        
+        # Lưu ID vào file removed_reactions.json
+        removed_list = load_removed_reactions()
+        if member.id not in removed_list:
+            removed_list.append(member.id)
+            save_removed_reactions(removed_list)
+            print(f"[DECLARE] Đã lưu {member.id} vào removed_reactions.json")
+            
+    except discord.NotFound:
+        print(f"[DECLARE] Không tìm thấy tin nhắn declare")
+    except Exception as e:
+        print(f"[DECLARE] Lỗi khi xóa reactions: {e}")
 
 def ensure_blacklist_file():
     if not os.path.exists(BLACKLIST_FILE):
@@ -327,6 +998,7 @@ async def sync_declare_reactions():
         return
 
     valid_emojis = {EMOJI_VIET_ID, EMOJI_NON_VIET_ID}
+    removed_users = load_removed_reactions()
 
     async for message in channel.history(limit=None):
         for reaction in message.reactions:
@@ -343,8 +1015,17 @@ async def sync_declare_reactions():
                 if user.bot:
                     continue
 
-                member = await guild.fetch_member(user.id)
-                await apply_declare_role(member, reaction.emoji.id, mode="sync")
+                # Bỏ qua user đã bị xóa reaction
+                if user.id in removed_users:
+                    continue
+
+                try:
+                    member = await guild.fetch_member(user.id)
+                    await apply_declare_role(member, reaction.emoji.id, mode="sync")
+                except discord.NotFound:
+                    continue
+                except Exception as e:
+                    print(f"Lỗi khi fetch member {user.id}: {e}")
 
     print("✅ Startup cleanup hoàn tất (chỉ DECLARE_CHANNEL)")
 @client.event
@@ -365,7 +1046,10 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         return
 
     channel = guild.get_channel(payload.channel_id)
-    member = await guild.fetch_member(payload.user_id)
+    try:
+        member = await guild.fetch_member(payload.user_id)
+    except discord.NotFound:
+        return
 
     if not channel or not member:
         return
@@ -460,6 +1144,21 @@ async def check_missed_welcomes(guild: discord.Guild):
 #----------CHỨC NĂNG CHÀO MỪNG-----------
 @client.event
 async def on_member_join(member: discord.Member):
+    # ================== JAIL SYSTEM MEMBER JOIN DETECTION ==================
+    # Kiểm tra xem người dùng có trong jail state không
+    jail_state = load_jail_state()
+    user_id_str = str(member.id)
+    
+    if user_id_str in jail_state:
+        # Người dùng đang bị giam - đảm bảo họ có role tù nhân
+        jail_role = member.guild.get_role(JAIL_ROLE_ID)
+        if jail_role:
+            try:
+                await member.add_roles(jail_role)
+                print(f"[JAIL] {member.id} vào lại server - đã gán lại role tù nhân")
+            except Exception as e:
+                print(f"[JAIL] Lỗi khi gán lại role tù nhân cho {member.id}: {e}")
+    
     channel = client.get_channel(WELCOME_CHANNEL_ID)
     if channel is None:
         return
@@ -468,8 +1167,8 @@ async def on_member_join(member: discord.Member):
         title="🎉 Chào mừng!",
         description=(
             f"XIN CHÀO & CHAO XÌN<:zo:1407589454570328074>{member.mention} 👋\n"
-            f"-Chào mừng bạn đến với<:pepelaughing:1407589824835227698>**{member.guild.name}**<:pepelaughingflip:1454883401428504880>\n"
-            f"-Nơi giao lưu, tụ họp và chuyện trò của những con người có chung niềm đam mê với <:bantumlum:1454884543948394549>**Friday the 13th: The Game**.\n"
+            f"-Chào mừng bạn đến với<:pepelaughing:1407589824835227698>**{member.guild.name}**<:MichaelMyers:1555609639062732831>\n"
+            f"-Nơi giao lưu, tụ họp và chuyện trò của những con người có chung niềm đam mê với <:bantumlum:1454884543948394549>**Game**.\n"
             f"-À và cả những tựa game khác nữa<:thanlong1:1516838947282485258><:pepehutthuoc:1411605379552378910>....\n"
             f"-Đừng quên đọc qua <#{1407058431134666992}> để nắm thêm thông tin"
         ),
@@ -484,6 +1183,10 @@ async def on_member_join(member: discord.Member):
 #----------CHỨC NĂNG TẠM BIỆT-----------
 @client.event
 async def on_member_remove(member: discord.Member):
+    if member.id in kicked_banned_users:
+        kicked_banned_users.discard(member.id)
+        return
+
     channel = client.get_channel(GOODBYE_CHANNEL_ID)
     if channel is None:
         return
@@ -500,6 +1203,9 @@ async def on_member_remove(member: discord.Member):
 
     await channel.send(embed=embed)
 
+    # Xóa reactions khỏi tin nhắn declare
+    await remove_declare_reactions(member)
+
     # Tự động xoá theo dõi nickname Steam nếu người dùng rời server
     links = load_steam_links()
     user_id_str = str(member.id)
@@ -507,6 +1213,150 @@ async def on_member_remove(member: discord.Member):
         del links[user_id_str]
         save_steam_links(links)
         print(f"[STEAM NICK] Đã xóa gán Steam cho {member.name} ({member.id}) vì rời server.")
+
+#-------------------SLASH COMMAND KICK & BAN---------------------
+MOD_ROLE_ID = 1407045564964536500
+
+@client.tree.command(
+    name="ban",
+    description="Ban một thành viên khỏi server",
+    guild=discord.Object(id=GUILD_ID)
+)
+@app_commands.describe(member="Thành viên cần ban", reason="Lý do ban", language="Ngôn ngữ (0=Tiếng Việt, 1=English)")
+async def ban_command(interaction: discord.Interaction, member: discord.Member, reason: str, language: int):
+    if not any(role.id == MOD_ROLE_ID for role in interaction.user.roles):
+        await interaction.response.send_message("❌ Bạn không có quyền dùng lệnh này.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    
+    channel = client.get_channel(GOODBYE_CHANNEL_ID)
+    
+    kicked_banned_users.add(member.id)
+    try:
+        # Gửi DM thông báo cho user bị ban
+        try:
+            if language == 1:
+                dm_message = (
+                    f"You have been banned from the 🇻🇳 server for the following reason: {reason}\n"
+                    f"If you have any complaints, please contact the admins at:\n"
+                    f"- Hoài Nam: sleepyraynor\n"
+                    f"- Nonne: phuonghoangphoenix\n"
+                    f"- Negan: kutj19953(temporarily unavailable)"
+                )
+            else:
+                dm_message = (
+                    f"Bạn đã bị ban khỏi server 🇻🇳 với lý do: {reason}\n"
+                    f"Nếu có khiếu nại xin hãy liên hệ admin có địa chỉ như sau:\n"
+                    f"- Hoài Nam: sleepyraynor\n"
+                    f"- Nonne: phuonghoangphoenix\n"
+                    f"- Negan: kutj19953(đã tạm dừng vô thời hạn)"
+                )
+            await member.send(dm_message)
+        except discord.Forbidden:
+            print(f"[BAN] Không thể gửi DM cho {member.name} ({member.id}) - có thể đã block bot")
+        except Exception as e:
+            print(f"[BAN] Lỗi khi gửi DM: {e}")
+        
+        await member.ban(reason=f"Banned by {interaction.user.name}: {reason}")
+        
+        # Xóa reactions khỏi tin nhắn declare
+        await remove_declare_reactions(member)
+        
+        if channel:
+            if language == 1:
+                embed = discord.Embed(
+                    title="<:mow_emoji:1407590613049675886> Goodbye!",
+                    description=f"-{member.mention} AKA {member.display_name} has been banned from **{member.guild.name}** for the following reason: {reason}<:Rana:1407589615875002379>\n",
+                    color=discord.Color.red()
+                )
+            else:
+                embed = discord.Embed(
+                    title="<:mow_emoji:1407590613049675886> Tạm biệt!",
+                    description=f"-{member.mention} AKA {member.display_name} đã bị ban khỏi **{member.guild.name}** với lý do: {reason}<:Rana:1407589615875002379>\n",
+                    color=discord.Color.red()
+                )
+            embed.set_thumbnail(url=member.display_avatar.url)
+            await channel.send(embed=embed)
+            
+        await interaction.followup.send(f"✅ Đã ban {member.mention}.", ephemeral=True)
+    except discord.Forbidden:
+        kicked_banned_users.discard(member.id)
+        await interaction.followup.send("❌ Bot không đủ quyền để ban người này.", ephemeral=True)
+    except Exception as e:
+        kicked_banned_users.discard(member.id)
+        await interaction.followup.send(f"❌ Có lỗi xảy ra: {e}", ephemeral=True)
+
+
+@client.tree.command(
+    name="kick",
+    description="Kick một thành viên khỏi server",
+    guild=discord.Object(id=GUILD_ID)
+)
+@app_commands.describe(member="Thành viên cần kick", reason="Lý do kick", language="Ngôn ngữ (0=Tiếng Việt, 1=English)")
+async def kick_command(interaction: discord.Interaction, member: discord.Member, reason: str, language: int):
+    if not any(role.id == MOD_ROLE_ID for role in interaction.user.roles):
+        await interaction.response.send_message("❌ Bạn không có quyền dùng lệnh này.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    
+    channel = client.get_channel(GOODBYE_CHANNEL_ID)
+    
+    kicked_banned_users.add(member.id)
+    try:
+        # Gửi DM thông báo cho user bị kick
+        try:
+            if language == 1:
+                dm_message = (
+                    f"You have been kicked from the 🇻🇳 server for the following reason: {reason}\n"
+                    f"If you have any complaints, please contact the admins at:\n"
+                    f"- Hoài Nam: sleepyraynor\n"
+                    f"- Nonne: phuonghoangphoenix\n"
+                    f"- Negan: kutj19953(temporarily unavailable)"
+                )
+            else:
+                dm_message = (
+                    f"Bạn đã bị kick khỏi server 🇻🇳 với lý do: {reason}\n"
+                    f"Nếu có khiếu nại xin hãy liên hệ admin có địa chỉ như sau:\n"
+                    f"- Hoài Nam: sleepyraynor\n"
+                    f"- Nonne: phuonghoangphoenix\n"
+                    f"- Negan: kutj19953(đã tạm dừng vô thời hạn)"
+                )
+            await member.send(dm_message)
+        except discord.Forbidden:
+            print(f"[KICK] Không thể gửi DM cho {member.name} ({member.id}) - có thể đã block bot")
+        except Exception as e:
+            print(f"[KICK] Lỗi khi gửi DM: {e}")
+        
+        await member.kick(reason=f"Kicked by {interaction.user.name}: {reason}")
+        
+        # Xóa reactions khỏi tin nhắn declare
+        await remove_declare_reactions(member)
+        
+        if channel:
+            if language == 1:
+                embed = discord.Embed(
+                    title="<:mow_emoji:1407590613049675886> Goodbye!",
+                    description=f"-{member.mention} AKA {member.display_name} has been kicked from **{member.guild.name}** for the following reason: {reason}<:Rana:1407589615875002379>\n",
+                    color=discord.Color.red()
+                )
+            else:
+                embed = discord.Embed(
+                    title="<:mow_emoji:1407590613049675886> Tạm biệt!",
+                    description=f"-{member.mention} AKA {member.display_name} đã bị kick khỏi **{member.guild.name}** với lý do: {reason}<:Rana:1407589615875002379>\n",
+                    color=discord.Color.red()
+                )
+            embed.set_thumbnail(url=member.display_avatar.url)
+            await channel.send(embed=embed)
+            
+        await interaction.followup.send(f"✅ Đã kick {member.mention}.", ephemeral=True)
+    except discord.Forbidden:
+        kicked_banned_users.discard(member.id)
+        await interaction.followup.send("❌ Bot không đủ quyền để kick người này.", ephemeral=True)
+    except Exception as e:
+        kicked_banned_users.discard(member.id)
+        await interaction.followup.send(f"❌ Có lỗi xảy ra: {e}", ephemeral=True)
 
 #-------------------MANUAL WELCOME & GOODBYE---------------------
 @client.tree.command(
@@ -529,8 +1379,8 @@ async def welcome_manual(interaction: discord.Interaction, member: discord.Membe
         title="🎉 Chào mừng!",
         description=(
             f"XIN CHÀO & CHAO XÌN<:zo:1407589454570328074>{member.mention} 👋\n"
-            f"-Chào mừng bạn đến với<:pepelaughing:1407589824835227698>**{interaction.guild.name}**<:pepelaughingflip:1454883401428504880>\n"
-            f"-Nơi giao lưu, tụ họp và chuyện trò của những con người có chung niềm đam mê với <:bantumlum:1454884543948394549>**Friday the 13th: The Game**.\n"
+            f"-Chào mừng bạn đến với<:pepelaughing:1407589824835227698>**{interaction.guild.name}**<:MichaelMyers:1555609639062732831>\n"
+            f"-Nơi giao lưu, tụ họp và chuyện trò của những con người có chung niềm đam mê với <:bantumlum:1454884543948394549>**Game**.\n"
             f"-À và cả những tựa game khác nữa<:thanlong1:1516838947282485258><:pepehutthuoc:1411605379552378910>....\n"
             f"-Đừng quên đọc qua <#{1407058431134666992}> để nắm thêm thông tin"
         ),
@@ -737,6 +1587,18 @@ async def checksteam(interaction: discord.Interaction, username: str):
         )
 
 # ---------------- THEO DÕI NICKNAME STEAM TỰ ĐỘNG ----------------
+COUNTRY_FLAG_MAP = {
+    "indonesia": "🇮🇩",
+    "thailand": "🇹🇭",
+    "philippines": "🇵🇭",
+    "china": "🇨🇳",
+    "malaysia": "🇲🇾",
+    "taiwan": "🇹🇼",
+    "korea": "🇰🇷",
+    "japan": "🇯🇵",
+    "vietnam": "",  # Vietnam không có flag
+}
+
 def load_steam_links():
     if not os.path.exists(STEAM_LINKS_FILE):
         return {}
@@ -776,6 +1638,55 @@ async def resolve_steam_id(profile_url: str) -> str | None:
     return None
 
 @tasks.loop(hours=1.0)
+async def check_duplicate_roles():
+    """Kiểm tra và xử lý người dùng có 2 role trùng nhau mỗi 1 tiếng"""
+    guild = client.get_guild(GUILD_ID)
+    if not guild:
+        return
+        
+    role1 = guild.get_role(1452965477319049359)
+    role2 = guild.get_role(1452968245509226619)
+    if not role1 or not role2:
+        return
+
+    channel = guild.get_channel(1465050026215477428)
+    warning_channel = guild.get_channel(1399701361469165669)
+    if not channel or not warning_channel:
+        return
+        
+    try:
+        msg = await channel.fetch_message(1465050575589605407)
+    except Exception as e:
+        print(f"[DUPLICATE ROLE] Lỗi không lấy được tin nhắn khai báo: {e}")
+        return
+
+    for member in guild.members:
+        if role1 in member.roles and role2 in member.roles:
+            has_reaction = False
+            for reaction in msg.reactions:
+                async for user in reaction.users():
+                    if user.id == member.id:
+                        has_reaction = True
+                        try:
+                            await msg.remove_reaction(reaction.emoji, member)
+                            print(f"[DUPLICATE ROLE] Đã xoá reaction của {member.name}")
+                        except Exception as e:
+                            print(f"[DUPLICATE ROLE] Lỗi khi xoá reaction của {member.name}: {e}")
+            
+            if not has_reaction:
+                try:
+                    await warning_channel.send(f"{member.mention} bạn đã lấy nhầm role")
+                    print(f"[DUPLICATE ROLE] Đã gửi cảnh báo cho {member.name}")
+                except Exception as e:
+                    print(f"[DUPLICATE ROLE] Lỗi gửi cảnh báo cho {member.name}: {e}")
+
+@tasks.loop(hours=24.0)
+async def cleanup_music_cache():
+    """Clean up old music cache files every 24 hours"""
+    print("[CLEANUP] Running scheduled cache cleanup")
+    cleanup_old_cache_files(max_age_hours=168)  # 7 days
+
+@tasks.loop(hours=1.0)
 async def track_steam_nicknames():
     """Task tự động cập nhật nickname Discord theo Steam mỗi 1 tiếng"""
     guild = client.get_guild(GUILD_ID)
@@ -790,7 +1701,14 @@ async def track_steam_nicknames():
     if not links:
         return
 
-    steam_ids = list(links.values())
+    # Extract steam_ids from links (handle both old string format and new dict format)
+    steam_ids = []
+    for link_data in links.values():
+        if isinstance(link_data, str):
+            steam_ids.append(link_data)
+        else:
+            steam_ids.append(link_data.get("steam_id", ""))
+    
     all_players = {}
 
     # Steam API cho phép lấy tối đa 100 IDs mỗi lần
@@ -814,7 +1732,15 @@ async def track_steam_nicknames():
     # Duyệt danh sách để cập nhật nickname
     links_changed = False
     for discord_id_str in list(links.keys()):
-        steam_id = links[discord_id_str]
+        link_data = links[discord_id_str]
+        # Handle both old format (string) and new format (dict)
+        if isinstance(link_data, str):
+            steam_id = link_data
+            country = ""
+        else:
+            steam_id = link_data.get("steam_id", "")
+            country = link_data.get("country", "")
+        
         try:
             member = guild.get_member(int(discord_id_str))
             if not member:
@@ -833,7 +1759,12 @@ async def track_steam_nicknames():
                 steam_name = all_players[steam_id]
                 # Lấy tên gốc Discord (Global Name hoặc Username), không lấy biệt danh server
                 discord_base_name = member.global_name or member.name
+                country_flag = COUNTRY_FLAG_MAP.get(country, "")
                 new_nick = f"{discord_base_name} ({steam_name})"
+                
+                # Thêm flag quốc gia nếu có (trừ Vietnam)
+                if country_flag:
+                    new_nick = f"{new_nick} {country_flag}"
                 
                 # Đảm bảo không quá 32 ký tự (giới hạn của Discord)
                 if len(new_nick) > 32:
@@ -845,6 +1776,8 @@ async def track_steam_nicknames():
                     if guild.me.top_role > member.top_role and member.id != guild.owner_id:
                         await member.edit(nick=new_nick, reason="Đồng bộ Steam Nickname")
                         print(f"[STEAM NICK] Đã cập nhật {member.name} -> {new_nick}")
+                else:
+                    print(f"[STEAM NICK] Nickname của {member.name} đã đúng: {new_nick}")
             except Exception:
                 continue
 
@@ -856,8 +1789,8 @@ async def track_steam_nicknames():
     description="Gán nickname Steam để bot tự động cập nhật cho người dùng",
     guild=discord.Object(id=GUILD_ID)
 )
-@app_commands.describe(member="Người dùng Discord", profile_url="Link profile Steam")
-async def linksteam(interaction: discord.Interaction, member: discord.Member, profile_url: str):
+@app_commands.describe(member="Người dùng Discord", profile_url="Link profile Steam", country="Quốc gia (indonesia, thailand, philippines, china, malaysia, taiwan, korea, japan, vietnam)")
+async def linksteam(interaction: discord.Interaction, member: discord.Member, profile_url: str, country: str = ""):
     if not any(role.id in CHECKSTEAM_ALLOWED_ROLE_IDS for role in interaction.user.roles):
         await interaction.response.send_message("❌ Bạn không có quyền dùng lệnh này.", ephemeral=True)
         return
@@ -869,11 +1802,19 @@ async def linksteam(interaction: discord.Interaction, member: discord.Member, pr
         await interaction.followup.send("❌ Không thể lấy SteamID từ link. Hãy dùng link dạng /profiles/ hoặc /id/.", ephemeral=True)
         return
 
+    # Normalize country name to lowercase
+    country_lower = country.lower().strip()
+    country_flag = COUNTRY_FLAG_MAP.get(country_lower, "")
+    
     links = load_steam_links()
-    links[str(member.id)] = steam_id
+    links[str(member.id)] = {
+        "steam_id": steam_id,
+        "country": country_lower
+    }
     save_steam_links(links)
 
-    await interaction.followup.send(f"✅ Đã gán {member.mention} với SteamID `{steam_id}`. Nickname sẽ tự động cập nhật mỗi giờ.", ephemeral=True)
+    flag_text = f" với flag {country_flag}" if country_flag else ""
+    await interaction.followup.send(f"✅ Đã gán {member.mention} với SteamID `{steam_id}`{flag_text}. Nickname sẽ tự động cập nhật mỗi giờ.", ephemeral=True)
 
 @client.tree.command(
     name="unlinksteam",
@@ -929,41 +1870,86 @@ async def listlink(interaction: discord.Interaction):
 
 VOICE_ALLOWED_ROLE_IDS = [1452965477319049359, 1452968245509226619]
 tts_playing = set()     # guild_id đang talkgoogle
+pending_talkgoogle_messages = set() # tin nhắn talkgoogle đang chờ xóa
+bot_channel_original_overwrites = {} # Lưu trạng thái permissions ban đầu của kênh bot
+
+@tasks.loop(seconds=5.0)
+async def sync_voice_permissions():
+    guild = client.get_guild(GUILD_ID)
+    if not guild: return
+    vc = discord.utils.get(client.voice_clients, guild=guild)
+    if not vc or not vc.is_connected():
+        sync_voice_permissions.stop()
+        return
+        
+    bot_channel = guild.get_channel(1454830895453442089)
+    if not bot_channel: return
+    
+    current_overwrites = bot_channel.overwrites
+    current_member_ids = {k.id for k, v in current_overwrites.items() if isinstance(k, discord.Member) and v.view_channel == True}
+    vc_member_ids = {m.id for m in vc.channel.members}
+    
+    if current_member_ids != vc_member_ids:
+        new_overwrites = {}
+        new_overwrites[guild.default_role] = discord.PermissionOverwrite(view_channel=False)
+        for member in vc.channel.members:
+            new_overwrites[member] = discord.PermissionOverwrite(view_channel=True)
+            
+        try:
+            await bot_channel.edit(overwrites=new_overwrites)
+            # Lưu trạng thái kênh vào file
+            save_bot_channel_state(new_overwrites)
+        except Exception:
+            pass
+
 @client.tree.command(
     name="talkgoogle",
-    description="Bot vào voice channel và đọc nội dung bằng giọng chị Google",
+    description="Cài đặt ngôn ngữ cho Google TTS (sau đó dùng !google <text> để đọc)",
     guild=discord.Object(id=GUILD_ID)
 )
 @discord.app_commands.describe(
-    lang="Languages Code, which support voice in Google Translate(Examples: vi, en, ja, id, ko...)",
-    text="Nội dung muốn bot đọc"
+    lang="Languages Code, which support voice in Google Translate(Examples: vi, en, ja, id, ko...)"
 )
-async def talkgoogle(interaction: discord.Interaction, lang: str, text: str):
+async def talkgoogle(interaction: discord.Interaction, lang: str):
 
     guild_id = interaction.guild.id
 
-    if guild_id in music_playing:
-        await interaction.response.send_message(
-            "❌ Bot đang phát nhạc. Không thể dùng talkgoogle lúc này.",
-            ephemeral=True
-        )
+    if interaction.channel.id != 1454830895453442089:
+        try:
+            await interaction.response.send_message(
+                "⚠️ Lệnh này chỉ được dùng trong kênh <#1454830895453442089>.",
+                ephemeral=True
+            )
+        except Exception:
+            pass
         return
 
     # Kiểm tra role
     if not any(role.id in VOICE_ALLOWED_ROLE_IDS for role in interaction.user.roles):
-        await interaction.response.send_message(
-            "❌ Bạn không có quyền dùng lệnh này.",
-            ephemeral=True
-        )
+        try:
+            await interaction.response.send_message(
+                "❌ Bạn không có quyền dùng lệnh này.",
+                ephemeral=True
+            )
+        except Exception:
+            pass
         return
 
     # Kiểm tra user có ở voice không
     if not interaction.user.voice or not interaction.user.voice.channel:
-        await interaction.response.send_message(
-            "❌ Bạn phải vào voice channel trước khi dùng lệnh này.",
-            ephemeral=True
-        )
+        try:
+            await interaction.response.send_message(
+                "❌ Bạn phải vào voice channel trước khi dùng lệnh này.",
+                ephemeral=True
+            )
+        except Exception:
+            pass
         return
+
+    # Lưu cài đặt ngôn ngữ
+    voice_settings = load_voice_settings()
+    voice_settings["google"]["language"] = lang
+    save_voice_settings(voice_settings)
 
     voice_channel = interaction.user.voice.channel
 
@@ -973,55 +1959,211 @@ async def talkgoogle(interaction: discord.Interaction, lang: str, text: str):
         guild=interaction.guild
     )
 
-    if not vc or not vc.is_connected():
-        vc = await voice_channel.connect()
-    elif vc.channel != voice_channel:
-        await vc.move_to(voice_channel)
+    # Ẩn kênh chat với everyone và hiện với người trong voice channel
+    bot_channel = interaction.guild.get_channel(1454830895453442089)
+    if bot_channel:
+        try:
+            # CHỈ lưu trạng thái gốc LẦN ĐẦU TIÊN (khi file chưa tồn tại)
+            # Sau đó KHÔNG ghi đè để giữ nguyên trạng thái gốc ban đầu
+            if not os.path.exists(BOT_CHANNEL_ORIGINAL_STATE_FILE):
+                save_original_bot_channel_state(bot_channel.overwrites)
+                print("[talkgoogle] Saved original bot channel state (first time)")
+            
+            # Lưu lại trạng thái ban đầu của kênh nếu chưa lưu (cho runtime)
+            if not bot_channel_original_overwrites:
+                bot_channel_original_overwrites.update(bot_channel.overwrites)
+            
+            # Xoá hết các role cũ, chỉ giữ @everyone và cập nhật thành viên trong voice
+            new_overwrites = {}
+            new_overwrites[interaction.guild.default_role] = discord.PermissionOverwrite(view_channel=False)
+                
+            # Cấp quyền xem cho các thành viên có mặt trong voice channel
+            for member in voice_channel.members:
+                new_overwrites[member] = discord.PermissionOverwrite(view_channel=True)
+                
+            await bot_channel.edit(overwrites=new_overwrites)
+            
+            # Lưu trạng thái voice vào file
+            save_bot_channel_state(new_overwrites)
+        except Exception as e:
+            print(f"[talkgoogle] Lỗi đổi quyền: {e}")
 
-  
-    # Tạo file TTS
     try:
-        tts = gTTS(text=text, lang=lang)
-        filename = f"voice_{interaction.user.id}.mp3"
-        tts.save(filename)
-    except Exception:
-        await interaction.response.send_message(
-            f"❌ Ngôn ngữ `{lang}` không được hỗ trợ hoặc có lỗi xảy ra.",
-            ephemeral=True
-        )
+        if not vc or not vc.is_connected():
+            vc = await voice_channel.connect()
+        elif vc.channel != voice_channel:
+            await vc.move_to(voice_channel)
+            
+        if not sync_voice_permissions.is_running():
+            sync_voice_permissions.start()
+    except Exception as e:
+        print(f"[talkgoogle] Lỗi khi kết nối voice: {e}")
+        try:
+            await interaction.response.send_message("❌ Có lỗi khi kết nối vào voice channel.", ephemeral=True)
+        except Exception:
+            pass
         return
 
-    tts_playing.add(guild_id)
-
- 
-    # Phát file qua FFmpeg
     try:
-        vc.play(discord.FFmpegPCMAudio(
-            executable=FFMPEG_EXE,
-            source=filename
-        ))
-
-        # GỬI TIN NHẮN CÔNG KHAI TRONG KÊNH CHAT
-        embed = discord.Embed(
-            title="🔊 Google TTS",
-            color=discord.Color.blue(),
-            description=f"**[{lang.upper()}]** {text}"
-        )
-        embed.set_author(
-            name=f"{interaction.user.display_name} đã nói:",
-            icon_url=interaction.user.display_avatar.url
-        )
         await interaction.response.send_message(
-            embed=embed,
-            ephemeral=False
+            f"✅ Đã cài đặt Google TTS với ngôn ngữ: **{lang}**\n"
+            f"Sử dụng `!google <text>` để bot đọc.",
+            ephemeral=True
         )
-        # Chờ đọc xong
-        while vc.is_playing():
-            await asyncio.sleep(1)
-    finally:
-        if os.path.exists(filename):
-            os.remove(filename)
-    tts_playing.discard(guild_id)
+    except Exception:
+        pass
+
+# --------------------- SLASH COMMAND PIPER TTS ---------------------
+pending_talkvoice_messages = set() # tin nhắn talkvoice đang chờ xóa
+
+# Autocomplete for language parameter
+async def language_autocomplete(
+    interaction: discord.Interaction,
+    current: str
+) -> list[app_commands.Choice[str]]:
+    languages = tts_piper.get_available_languages()
+    return [
+        app_commands.Choice(name=lang, value=lang)
+        for lang in languages
+        if current.lower() in lang.lower()
+    ][:25]
+
+@client.tree.command(
+    name="talkvoice",
+    description="Cài đặt ngôn ngữ và giọng cho Piper TTS (sau đó dùng !voice <text> để đọc)",
+    guild=discord.Object(id=GUILD_ID)
+)
+@discord.app_commands.describe(
+    language="Language code (e.g., vi, en, ja, ko...)",
+    voice="Voice model name"
+)
+@discord.app_commands.autocomplete(language=language_autocomplete)
+async def talkvoice(interaction: discord.Interaction, language: str, voice: str):
+
+    guild_id = interaction.guild.id
+
+    if interaction.channel.id != 1454830895453442089:
+        try:
+            await interaction.response.send_message(
+                "⚠️ Lệnh này chỉ được dùng trong kênh <#1454830895453442089>.",
+                ephemeral=True
+            )
+        except Exception:
+            pass
+        return
+
+    # Kiểm tra role
+    if not any(role.id in VOICE_ALLOWED_ROLE_IDS for role in interaction.user.roles):
+        try:
+            await interaction.response.send_message(
+                "❌ Bạn không có quyền dùng lệnh này.",
+                ephemeral=True
+            )
+        except Exception:
+            pass
+        return
+
+    # Kiểm tra user có ở voice không
+    if not interaction.user.voice or not interaction.user.voice.channel:
+        try:
+            await interaction.response.send_message(
+                "❌ Bạn phải vào voice channel trước khi dùng lệnh này.",
+                ephemeral=True
+            )
+        except Exception:
+            pass
+        return
+
+    # Validate language and voice
+    available_languages = tts_piper.get_available_languages()
+    if language not in available_languages:
+        try:
+            await interaction.response.send_message(
+                f"❌ Ngôn ngữ `{language}` không được hỗ trợ. Các ngôn ngữ có sẵn: {', '.join(available_languages)}",
+                ephemeral=True
+            )
+        except Exception:
+            pass
+        return
+
+    available_voices = tts_piper.get_available_voices(language)
+    if voice not in available_voices:
+        try:
+            await interaction.response.send_message(
+                f"❌ Giọng `{voice}` không tồn tại cho ngôn ngữ `{language}`. Các giọng có sẵn: {', '.join(available_voices)}",
+                ephemeral=True
+            )
+        except Exception:
+            pass
+        return
+
+    # Lưu cài đặt ngôn ngữ và giọng
+    voice_settings = load_voice_settings()
+    voice_settings["voice"]["language"] = language
+    voice_settings["voice"]["voice"] = voice
+    save_voice_settings(voice_settings)
+
+    voice_channel = interaction.user.voice.channel
+
+    # Lấy hoặc kết nối voice client
+    vc = discord.utils.get(
+        interaction.client.voice_clients,
+        guild=interaction.guild
+    )
+
+    # Ẩn kênh chat với everyone và hiện với người trong voice channel
+    bot_channel = interaction.guild.get_channel(1454830895453442089)
+    if bot_channel:
+        try:
+            # CHỈ lưu trạng thái gốc LẦN ĐẦU TIÊN (khi file chưa tồn tại)
+            # Sau đó KHÔNG ghi đè để giữ nguyên trạng thái gốc ban đầu
+            if not os.path.exists(BOT_CHANNEL_ORIGINAL_STATE_FILE):
+                save_original_bot_channel_state(bot_channel.overwrites)
+                print("[talkvoice] Saved original bot channel state (first time)")
+            
+            # Lưu lại trạng thái ban đầu của kênh nếu chưa lưu (cho runtime)
+            if not bot_channel_original_overwrites:
+                bot_channel_original_overwrites.update(bot_channel.overwrites)
+            
+            # Xoá hết các role cũ, chỉ giữ @everyone và cập nhật thành viên trong voice
+            new_overwrites = {}
+            new_overwrites[interaction.guild.default_role] = discord.PermissionOverwrite(view_channel=False)
+                
+            # Cấp quyền xem cho các thành viên có mặt trong voice channel
+            for member in voice_channel.members:
+                new_overwrites[member] = discord.PermissionOverwrite(view_channel=True)
+                
+            await bot_channel.edit(overwrites=new_overwrites)
+            
+            # Lưu trạng thái voice vào file
+            save_bot_channel_state(new_overwrites)
+        except Exception as e:
+            print(f"[talkvoice] Lỗi đổi quyền: {e}")
+
+    try:
+        if not vc or not vc.is_connected():
+            vc = await voice_channel.connect()
+        elif vc.channel != voice_channel:
+            await vc.move_to(voice_channel)
+            
+        if not sync_voice_permissions.is_running():
+            sync_voice_permissions.start()
+    except Exception as e:
+        print(f"[talkvoice] Lỗi khi kết nối voice: {e}")
+        try:
+            await interaction.response.send_message("❌ Có lỗi khi kết nối vào voice channel.", ephemeral=True)
+        except Exception:
+            pass
+        return
+
+    try:
+        await interaction.response.send_message(
+            f"✅ Đã cài đặt Piper TTS với ngôn ngữ: **{language}**, giọng: **{voice}**\n"
+            f"Sử dụng `!voice <text>` để bot đọc.",
+            ephemeral=True
+        )
+    except Exception:
+        pass
 
 @client.event
 async def on_voice_state_update(member, before, after):
@@ -1034,22 +2176,58 @@ async def on_voice_state_update(member, before, after):
         return
 
     channel = vc.channel
+    guild = member.guild
 
     # Nếu còn người (ngoài bot) → hủy auto-disconnect
     if len(channel.members) > 1:
-        task = auto_disconnect_tasks.pop(member.guild.id, None)
+        task = auto_disconnect_tasks.pop(guild.id, None)
         if task:
             task.cancel()
         return
 
-    # Nếu chỉ còn bot → tạo task auto-disconnect
-    if member.guild.id not in auto_disconnect_tasks:
+    # Nếu chỉ còn bot → tạo task auto-disconnect với đầy đủ cleanup
+    if guild.id not in auto_disconnect_tasks:
         async def delayed_disconnect():
-            await asyncio.sleep(10)
-            if vc.is_connected() and len(channel.members) == 1:
-                await vc.disconnect()
+            await asyncio.sleep(5)  # Giảm xuống 5 giây để nhạy bén hơn
+            
+            # Kiểm tra lại trước khi disconnect
+            if not vc.is_connected() or len(channel.members) > 1:
+                return
+            
+            # Dừng sync permissions
+            if sync_voice_permissions.is_running():
+                sync_voice_permissions.cancel()
+            
+            # Xóa các tin nhắn talkgoogle chưa tới 20s
+            for msg in list(pending_talkgoogle_messages):
+                try:
+                    await msg.delete()
+                except Exception:
+                    pass
+            pending_talkgoogle_messages.clear()
 
-        auto_disconnect_tasks[member.guild.id] = asyncio.create_task(
+            # Xóa các tin nhắn talkvoice chưa tới 20s
+            for msg in list(pending_talkvoice_messages):
+                try:
+                    await msg.delete()
+                except Exception:
+                    pass
+            pending_talkvoice_messages.clear()
+
+            # Khôi phục quyền kênh chat về trạng thái gốc từ file
+            bot_channel = guild.get_channel(1454830895453442089)
+            if bot_channel:
+                try:
+                    await restore_original_bot_channel_state(guild)
+                    print("[AUTO-DISCONNECT] Restored original bot channel state")
+                except Exception as e:
+                    print(f"[AUTO-DISCONNECT] Lỗi khôi phục quyền: {e}")
+
+            # Disconnect
+            await vc.disconnect()
+            print(f"[AUTO-DISCONNECT] Bot đã rời voice channel")
+
+        auto_disconnect_tasks[guild.id] = asyncio.create_task(
             delayed_disconnect()
         )
 
@@ -1066,12 +2244,183 @@ async def leavevoice(interaction: discord.Interaction):
         await interaction.response.send_message("❌ Bạn không có quyền dùng lệnh này.", ephemeral=True)
         return
 
+    if sync_voice_permissions.is_running():
+        sync_voice_permissions.cancel()
+
+    # Xóa các tin nhắn talkgoogle chưa tới 20s
+    for msg in list(pending_talkgoogle_messages):
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+    pending_talkgoogle_messages.clear()
+
+    # Xóa các tin nhắn talkvoice chưa tới 20s
+    for msg in list(pending_talkvoice_messages):
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+    pending_talkvoice_messages.clear()
+
+    # Khôi phục quyền kênh chat về trạng thái gốc từ file
+    bot_channel = interaction.guild.get_channel(1454830895453442089)
+    if bot_channel:
+        try:
+            await restore_original_bot_channel_state(interaction.guild)
+            print("[leavevoice] Restored original bot channel state")
+        except Exception as e:
+            print(f"[leavevoice] Lỗi khôi phục quyền: {e}")
+
     vc = discord.utils.get(client.voice_clients, guild=interaction.guild)
     if vc and vc.is_connected():
         await vc.disconnect()
-        await interaction.response.send_message("👋 Bot đã rời voice channel.", ephemeral=True)
+        await interaction.response.send_message("👋 Bot đã rời voice channel và khôi phục kênh chat.", ephemeral=True)
     else:
         await interaction.response.send_message("⚠️ Bot không ở trong voice channel nào.", ephemeral=True)
+
+# --------------------- SLASH COMMAND JAIL SYSTEM ---------------------
+@client.tree.command(
+    name="jail",
+    description="Giam người vi phạm vào nhà tù",
+    guild=discord.Object(id=GUILD_ID)
+)
+@app_commands.describe(
+    member="Người bị giam",
+    keyword="Từ khóa cần spam để ra tù",
+    count="Số lần cần spam từ khóa",
+    reason="Lý do bị giam"
+)
+async def jail(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    keyword: str,
+    count: int,
+    reason: str
+):
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except Exception:
+        pass
+
+    # Kiểm tra admin role
+    if not any(role.id == JAIL_ADMIN_ROLE_ID for role in interaction.user.roles):
+        await interaction.followup.send("❌ Bạn không có quyền dùng lệnh này.", ephemeral=True)
+        return
+    
+    # Kiểm tra số lượng spam
+    if count <= 0:
+        await interaction.followup.send("❌ Số lần spam phải lớn hơn 0.", ephemeral=True)
+        return
+    
+    # Lưu role cũ của người bị giam
+    old_roles = [role.id for role in member.roles if not role.is_bot_managed() and role.id != member.guild.id]
+    
+    # Gán role tù nhân
+    jail_role = interaction.guild.get_role(JAIL_ROLE_ID)
+    if not jail_role:
+        await interaction.followup.send("❌ Không tìm thấy role tù nhân.", ephemeral=True)
+        return
+    
+    try:
+        await member.add_roles(jail_role)
+        # Xóa các role cũ (trừ role tù nhân và @everyone)
+        for role_id in old_roles:
+            role = interaction.guild.get_role(role_id)
+            if role and role.id != JAIL_ROLE_ID:
+                await member.remove_roles(role)
+        
+        # Lưu trạng thái vào file
+        jail_state = load_jail_state()
+        jail_state[str(member.id)] = {
+            "keyword": keyword,
+            "required_count": count,
+            "current_count": 0,
+            "last_spam_time": 0,
+            "old_roles": old_roles,
+            "bot_messages": [],  # ID các tin nhắn bot thông báo số lượng còn lại
+            "reason": reason  # Lý do bị giam
+        }
+        save_jail_state(jail_state)
+        
+        # Gửi tin nhắn thông báo vào kênh nhà tù
+        jail_channel = interaction.guild.get_channel(JAIL_CHANNEL_ID)
+        if jail_channel:
+            initial_msg = await jail_channel.send(
+                f"🔒 **{member.mention} đã bị giam vào nhà tù!**\n\n"
+                f"**Lý do:** {reason}\n"
+                f"**Người giam:** {interaction.user.mention}\n\n"
+                f"Để được thả, bạn cần spam từ khóa `{keyword}` đúng {count} lần.\n"
+                f"Bắt đầu spam ngay bây giờ!"
+            )
+            jail_state[str(member.id)]["bot_messages"].append(initial_msg.id)
+            save_jail_state(jail_state)
+        
+        await interaction.followup.send(f"🔒 Đã giam {member.mention} vào nhà tù. Cần spam `{keyword}` {count} lần để ra tù.", ephemeral=True)
+        print(f"[JAIL] Giam {member.id} - Keyword: {keyword}, Count: {count}, Reason: {reason}")
+    except Exception as e:
+        await interaction.followup.send(f"❌ Lỗi khi giam: {e}", ephemeral=True)
+        print(f"[JAIL] Lỗi: {e}")
+
+@client.tree.command(
+    name="unjail",
+    description="Thả tù nhân ra khỏi nhà tù",
+    guild=discord.Object(id=GUILD_ID)
+)
+@app_commands.describe(
+    member="Người được thả"
+)
+async def unjail(
+    interaction: discord.Interaction,
+    member: discord.Member
+):
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except Exception:
+        pass
+
+    # Kiểm tra admin role
+    if not any(role.id == JAIL_ADMIN_ROLE_ID for role in interaction.user.roles):
+        await interaction.followup.send("❌ Bạn không có quyền dùng lệnh này.", ephemeral=True)
+        return
+    
+    # Kiểm tra xem người đó có trong jail state không
+    jail_state = load_jail_state()
+    if str(member.id) not in jail_state:
+        await interaction.followup.send("❌ Người này không đang bị giam.", ephemeral=True)
+        return
+    
+    try:
+        # Khôi phục role cũ
+        old_roles = jail_state[str(member.id)]["old_roles"]
+        for role_id in old_roles:
+            role = interaction.guild.get_role(role_id)
+            if role:
+                await member.add_roles(role)
+        
+        # Xóa role tù nhân
+        jail_role = interaction.guild.get_role(JAIL_ROLE_ID)
+        if jail_role:
+            await member.remove_roles(jail_role)
+        
+        # Xóa toàn bộ tin nhắn trong kênh nhà tù
+        jail_channel = interaction.guild.get_channel(JAIL_CHANNEL_ID)
+        if jail_channel:
+            async for msg in jail_channel.history(limit=None):
+                try:
+                    await msg.delete()
+                except Exception:
+                    pass
+        
+        # Xóa khỏi jail state
+        del jail_state[str(member.id)]
+        save_jail_state(jail_state)
+        
+        await interaction.followup.send(f"🔓 Đã thả {member.mention} khỏi nhà tù.", ephemeral=True)
+        print(f"[JAIL] Thả {member.id}")
+    except Exception as e:
+        await interaction.followup.send(f"❌ Lỗi khi thả: {e}", ephemeral=True)
+        print(f"[JAIL] Lỗi: {e}")
 
 # --------------------- SLASH COMMAND GỬI TIN NHẮN RIÊNG --------------------
 INBOX_ALLOWED_ROLE_IDS = [1452965477319049359]  # Role được phép
@@ -1174,14 +2523,14 @@ async def handle_dm_reply(message: discord.Message):
     state = load_ai_state()
 
     # ================= AI DM (*ai) =================
-    if state["enabled"] and message.content.startswith(AI_DM_PREFIX):
+    if state["enabled"] and message.content.lower().startswith(AI_DM_PREFIX.lower()):
         if not remember_processed_message(message.id, processed_dm_message_ids):
             return
 
         await process_unified_ai_logic(message, AI_DM_PREFIX)
         return
 
-    if state["enabled"] and not message.content.startswith(AI_DM_PREFIX):
+    if state["enabled"] and not message.content.lower().startswith(AI_DM_PREFIX.lower()):
         await message.channel.send(
             "❌ Inbox hiện đang tạm ngưng vì AI đang bật."
         )
@@ -1549,12 +2898,6 @@ async def ensure_music_channel(interaction: discord.Interaction) -> bool:
 music_state = {}
 music_playing = set()   # guild_id đang phát YouTube
 
-YDL_MUSIC_OPTS = {
-    "format": "bestaudio/best",
-    "quiet": True,
-    "noplaylist": True,
-}
-
 def format_duration(seconds: int) -> str:
     seconds = int(seconds or 0)
     h, remainder = divmod(seconds, 3600)
@@ -1572,59 +2915,236 @@ def get_video_duration(info: dict) -> int:
     except (TypeError, ValueError):
         return 0
 
-def build_song_info(info: dict, source_url: str) -> dict:
+def build_song_info(info: dict, source_url: str, file_path: str = None) -> dict:
     duration = get_video_duration(info)
     return {
         "title": info.get("title", "Không rõ"),
-        "url": info["url"],
+        "url": info.get("url", ""),  # Keep for compatibility but won't be used for playback
         "source_url": info.get("webpage_url") or info.get("original_url") or source_url,
+        "video_id": info.get("id", ""),
         "duration": duration,
         "duration_seconds": duration,
         "duration_text": format_duration(duration) if duration else "Không rõ",
+        "file_path": file_path,
         "http_headers": info.get("http_headers") or {}
     }
 
 def extract_song_info(url: str) -> dict:
-    with yt_dlp.YoutubeDL(YDL_MUSIC_OPTS) as ydl:
-        info = ydl.extract_info(url, download=False)
-        return build_song_info(info, url)
+    """Extract song info using yt-dlp.exe with fallback methods"""
+    import subprocess
+    import json
+    
+    # Build base command
+    def build_cmd(extra_args=[]):
+        cmd = [
+            YTDLP_EXECUTABLE,
+            "--dump-json",
+            "--no-playlist",
+            "--no-check-certificate",
+            "--ignore-errors",
+            "--extract-flat", "false",
+            "--no-warnings",
+            url
+        ]
+        cmd.extend(extra_args)
+        return cmd
+    
+    # Try primary extraction
+    try:
+        cmd = build_cmd([
+            "--extractor-args", "youtube:player_client=android,android_music,web",
+            "--extractor-args", "youtube:player_skip=js,configs,age_gate",
+            "--extractor-args", "youtube:age_gate=False",
+        ])
+        print(f"[EXTRACT] Running: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode == 0:
+            info = json.loads(result.stdout)
+            video_id = info.get("id", "")
+            file_path = os.path.join(MUSIC_CACHE_DIR, f"{video_id}.mp3")
+            return build_song_info(info, url, file_path)
+    except Exception as e:
+        print(f"[EXTRACT] Primary extraction failed: {e}")
+    
+    # Fallback 1: Simpler options
+    try:
+        cmd = build_cmd([
+            "--extractor-args", "youtube:player_client=android",
+        ])
+        print(f"[EXTRACT] Fallback 1: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode == 0:
+            info = json.loads(result.stdout)
+            video_id = info.get("id", "")
+            file_path = os.path.join(MUSIC_CACHE_DIR, f"{video_id}.mp3")
+            return build_song_info(info, url, file_path)
+    except Exception as e:
+        print(f"[EXTRACT] Fallback 1 failed: {e}")
+    
+    # Fallback 2: Minimal options
+    try:
+        cmd = build_cmd([])
+        print(f"[EXTRACT] Fallback 2: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode == 0:
+            info = json.loads(result.stdout)
+            video_id = info.get("id", "")
+            file_path = os.path.join(MUSIC_CACHE_DIR, f"{video_id}.mp3")
+            return build_song_info(info, url, file_path)
+    except Exception as e:
+        print(f"[EXTRACT] Fallback 2 failed: {e}")
+        raise
 
-def refresh_song_url(song: dict) -> str:
+def download_song(song: dict) -> bool:
+    """Download YouTube audio to local MP3 file using yt-dlp.exe with fallback methods"""
+    import subprocess
+    
     source_url = song.get("source_url") or song.get("webpage_url")
     if not source_url:
-        return song["url"]
+        print("[DOWNLOAD] No source URL found")
+        return False
 
-    with yt_dlp.YoutubeDL(YDL_MUSIC_OPTS) as ydl:
-        info = ydl.extract_info(source_url, download=False)
-        song["url"] = info["url"]
-        song["source_url"] = info.get("webpage_url") or info.get("original_url") or source_url
-        if not song.get("duration_seconds"):
-            duration = get_video_duration(info)
-            song["duration"] = duration
-            song["duration_seconds"] = duration
-            song["duration_text"] = format_duration(duration) if duration else "Không rõ"
-        song["http_headers"] = info.get("http_headers") or song.get("http_headers") or {}
-        if info.get("title"):
-            song["title"] = info["title"]
-        return song["url"]
+    video_id = song.get("video_id")
+    if not video_id:
+        print("[DOWNLOAD] No video ID found")
+        return False
 
-def build_ffmpeg_headers(song: dict) -> str:
-    headers = dict(song.get("http_headers") or {})
-    headers.setdefault(
-        "User-Agent",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
-    )
-    headers.setdefault("Accept", "*/*")
+    file_path = os.path.join(MUSIC_CACHE_DIR, f"{video_id}.mp3")
+    
+    # Check if file already exists
+    if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+        print(f"[DOWNLOAD] File already exists: {file_path}")
+        song["file_path"] = file_path
+        return True
 
-    header_lines = []
-    for key, value in headers.items():
-        if value is None:
-            continue
-        safe_key = str(key).replace("\r", "").replace("\n", "").replace('"', "")
-        safe_value = str(value).replace("\r", "").replace("\n", "").replace('"', "")
-        header_lines.append(f"{safe_key}: {safe_value}")
-    return "\r\n".join(header_lines)
+    print(f"[DOWNLOAD] Downloading {video_id} to {file_path}")
+    
+    # Build base command
+    def build_cmd(extra_args=[]):
+        cmd = [
+            YTDLP_EXECUTABLE,
+            "--format", "bestaudio/best",
+            "--extract-audio",
+            "--audio-format", "mp3",
+            "--audio-quality", "192K",
+            "--no-playlist",
+            "--no-check-certificate",
+            "--ignore-errors",
+            "--extract-flat", "false",
+            "--no-warnings",
+            "--output", os.path.join(MUSIC_CACHE_DIR, "%(id)s.%(ext)s"),
+            source_url
+        ]
+        cmd.extend(extra_args)
+        return cmd
+    
+    # Try primary download
+    try:
+        cmd = build_cmd([
+            "--extractor-args", "youtube:player_client=android,android_music,web",
+            "--extractor-args", "youtube:player_skip=js,configs,age_gate",
+            "--extractor-args", "youtube:age_gate=False",
+            "--retries", "5",
+            "--fragment-retries", "5",
+        ])
+        print(f"[DOWNLOAD] Running: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if result.returncode == 0:
+            if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                print(f"[DOWNLOAD] Successfully downloaded: {file_path}")
+                song["file_path"] = file_path
+                return True
+            else:
+                print(f"[DOWNLOAD] File not created or empty: {file_path}")
+        else:
+            print(f"[DOWNLOAD] Primary download failed with code {result.returncode}")
+            print(f"[DOWNLOAD] stderr: {result.stderr}")
+    except Exception as e:
+        print(f"[DOWNLOAD] Primary download failed: {e}")
+    
+    # Fallback 1: Simpler options
+    try:
+        print(f"[DOWNLOAD] Trying fallback 1...")
+        cmd = build_cmd([
+            "--extractor-args", "youtube:player_client=android",
+        ])
+        print(f"[DOWNLOAD] Fallback 1: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if result.returncode == 0:
+            if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                print(f"[DOWNLOAD] Fallback 1 succeeded: {file_path}")
+                song["file_path"] = file_path
+                return True
+    except Exception as e:
+        print(f"[DOWNLOAD] Fallback 1 failed: {e}")
+    
+    # Fallback 2: Minimal options
+    try:
+        print(f"[DOWNLOAD] Trying fallback 2...")
+        cmd = build_cmd([])
+        print(f"[DOWNLOAD] Fallback 2: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if result.returncode == 0:
+            if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                print(f"[DOWNLOAD] Fallback 2 succeeded: {file_path}")
+                song["file_path"] = file_path
+                return True
+    except Exception as e:
+        print(f"[DOWNLOAD] Fallback 2 failed: {e}")
+    
+    # All methods failed - clean up partial file
+    if os.path.exists(file_path):
+        try:
+            os.remove(file_path)
+            print(f"[DOWNLOAD] Cleaned up partial file: {file_path}")
+        except Exception as cleanup_error:
+            print(f"[DOWNLOAD] Error cleaning up partial file: {cleanup_error}")
+    
+    return False
+
+def cleanup_old_cache_files(max_age_hours: int = 168):
+    """Remove cache files older than max_age_hours (default 7 days)"""
+    if not os.path.exists(MUSIC_CACHE_DIR):
+        return
+    
+    import time
+    current_time = time.time()
+    max_age_seconds = max_age_hours * 3600
+    deleted_count = 0
+    
+    try:
+        for filename in os.listdir(MUSIC_CACHE_DIR):
+            if not filename.endswith(".mp3"):
+                continue
+            
+            file_path = os.path.join(MUSIC_CACHE_DIR, filename)
+            file_age = current_time - os.path.getmtime(file_path)
+            
+            # Check if file is currently being played
+            is_playing = False
+            for guild_id, state in music_state.items():
+                current = state.get("current")
+                if current and current.get("file_path") == file_path:
+                    if state.get("playing"):
+                        is_playing = True
+                        break
+            
+            if is_playing:
+                print(f"[CLEANUP] Skipping currently playing file: {filename}")
+                continue
+            
+            if file_age > max_age_seconds:
+                try:
+                    os.remove(file_path)
+                    print(f"[CLEANUP] Deleted old file: {filename} (age: {file_age/3600:.1f}h)")
+                    deleted_count += 1
+                except Exception as e:
+                    print(f"[CLEANUP] Error deleting {filename}: {e}")
+        
+        if deleted_count > 0:
+            print(f"[CLEANUP] Deleted {deleted_count} old cache files")
+    except Exception as e:
+        print(f"[CLEANUP] Error during cleanup: {e}")
 
 def parse_seek_time(value: str) -> int:
     parts = value.strip().split(":")
@@ -1693,10 +3213,18 @@ async def play(interaction: discord.Interaction, url: str):
     voice_channel = interaction.user.voice.channel
     vc = discord.utils.get(client.voice_clients, guild=interaction.guild)
 
+    print(f"[PLAY] Voice channel: {voice_channel.name if voice_channel else 'None'}")
+    print(f"[PLAY] Current VC: {vc}")
+    print(f"[PLAY] VC connected: {vc.is_connected() if vc else 'N/A'}")
+
     if not vc:
+        print("[PLAY] Connecting to voice channel...")
         vc = await voice_channel.connect()
+        print(f"[PLAY] Connected successfully: {vc}")
     elif vc.channel != voice_channel:
+        print("[PLAY] Moving to voice channel...")
         await vc.move_to(voice_channel)
+        print(f"[PLAY] Moved successfully")
 
     state["voice"] = vc
 
@@ -1843,16 +3371,22 @@ async def play_next(guild: discord.Guild):
     music_playing.add(guild_id)
 
     def after_music(err):
+        print(f"[AFTER_MUSIC] Callback called, play_id: {play_id}, current play_id: {state.get('play_id')}")
         if state.get("play_id") != play_id:
+            print("[AFTER_MUSIC] Play ID mismatch, ignoring")
             return
 
         if state.get("seeking"):
+            print("[AFTER_MUSIC] Seeking, ignoring")
             music_playing.discard(guild_id)
             return
 
         if err:
             print(f"[FFMPEG ERROR] {err}")
+            import traceback
+            traceback.print_exc()
 
+        print("[AFTER_MUSIC] Song finished, playing next")
         music_playing.discard(guild_id)
         state["playing"] = False
 
@@ -1879,34 +3413,108 @@ async def play_next(guild: discord.Guild):
             state["playing"] = False
             music_playing.discard(guild_id)
             asyncio.create_task(play_next(guild))
-async def play_song(vc, song, start_time=0, after=None, refresh=True):
-    if refresh:
-        await asyncio.to_thread(refresh_song_url, song)
+async def play_song(vc, song, start_time=0, after=None, download=True):
+    print("[FFMPEG DEBUG] Executable:", FFMPEG_EXECUTABLE)
+    print("[FFMPEG DEBUG] Exists:", os.path.isfile(FFMPEG_EXECUTABLE))
+    print(f"[PLAY SONG] Function called")
+    print(f"[PLAY SONG] VC object: {vc}")
+    print(f"[PLAY SONG] VC is playing: {vc.is_playing() if vc else 'N/A'}")
+    
+    # Download song if needed
+    if download:
+        print("[PLAY SONG] Downloading song...")
+        success = await asyncio.to_thread(download_song, song)
+        if not success:
+            print("[PLAY SONG] Download failed")
+            raise Exception("Failed to download song")
+        print("[PLAY SONG] Download completed")
 
-    header_block = build_ffmpeg_headers(song)
+    file_path = song.get("file_path")
+    if not file_path or not os.path.exists(file_path):
+        print(f"[PLAY SONG] File not found: {file_path}")
+        raise Exception(f"File not found: {file_path}")
+
+    print(f"[PLAY SONG] File path: {file_path}")
+    print(f"[PLAY SONG] Title: {song.get('title', 'Unknown')}")
+    
+    # Simple FFmpeg options for local file playback
     before_options = (
         "-nostdin "
         f"-ss {int(start_time)} "
-        "-reconnect 1 "
-        "-reconnect_streamed 1 "
-        "-reconnect_delay_max 5 "
-        "-reconnect_on_network_error 1 "
-        "-reconnect_on_http_error 403,404,429,500,502,503,504 "
-        f'-headers "{header_block}" '
     )
 
-    # Hybrid seek: -ss before input for speed, -ss 0 after input for accuracy/sync
-    options = "-vn -dn -sn -ignore_unknown -loglevel warning -ss 0"
+    options = "-vn -dn -sn -ignore_unknown -loglevel warning"
 
-    vc.play(
-        discord.FFmpegPCMAudio(
-            song["url"],
-            executable=FFMPEG_EXE,
+    try:
+        print("[PLAY SONG] Creating FFmpegPCMAudio source...")
+        source = discord.FFmpegPCMAudio(
+            file_path,
+            executable=FFMPEG_EXECUTABLE,
             before_options=before_options,
             options=options
-        ),
-        after=after
+        )
+        print(f"[PLAY SONG] Source created: {source}")
+        
+        print("[PLAY SONG] Calling vc.play()...")
+        vc.play(source, after=after)
+        print(f"[PLAY SONG] vc.play() called successfully")
+        print(f"[PLAY SONG] VC is playing after play: {vc.is_playing()}")
+    except Exception as e:
+        print(f"[PLAY SONG ERROR] {e}")
+        import traceback
+        traceback.print_exc()
+        raise
+
+@client.tree.command(
+    name="testaudio",
+    description="Test âm thanh đơn giản (beep)",
+    guild=discord.Object(id=GUILD_ID)
+)
+async def testaudio(interaction: discord.Interaction):
+    """Test command để kiểm tra xem bot có thể phát âm thanh được không"""
+    if not interaction.user.voice or not interaction.user.voice.channel:
+        await interaction.response.send_message("❌ Bạn phải vào voice channel trước.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    voice_channel = interaction.user.voice.channel
+    vc = discord.utils.get(client.voice_clients, guild=interaction.guild)
+
+    print(f"[TEST AUDIO] Voice channel: {voice_channel.name}")
+    print(f"[TEST AUDIO] Current VC: {vc}")
+
+    if not vc:
+        print("[TEST AUDIO] Connecting to voice...")
+        vc = await voice_channel.connect()
+    elif vc.channel != voice_channel:
+        print("[TEST AUDIO] Moving to voice...")
+        await vc.move_to(voice_channel)
+
+    print(f"[TEST AUDIO] Creating simple beep source...")
+    
+    # Tạo một beep đơn giản bằng FFmpeg
+    source = discord.FFmpegPCMAudio(
+        executable=FFMPEG_EXECUTABLE,
+        source="anullsrc=r=44100:cl=mono",  # Tạo silence
+        before_options="-f lavfi -t 3",  # 3 giây
+        options="-f s16le -ar 44100 -ac 1"
     )
+
+    print("[TEST AUDIO] Playing beep...")
+    vc.play(source)
+    
+    print(f"[TEST AUDIO] Is playing: {vc.is_playing()}")
+    
+    await interaction.followup.send("🔊 Đang test âm thanh (3 giây beep)", ephemeral=True)
+    
+    # Đợi 3 giây rồi dừng
+    await asyncio.sleep(3)
+    if vc.is_playing():
+        vc.stop()
+        print("[TEST AUDIO] Stopped")
+    
+    await interaction.followup.send("✅ Test hoàn tất", ephemeral=True)
            
 @client.tree.command(
     name="queue",
@@ -1988,13 +3596,99 @@ async def clearqueue(interaction: discord.Interaction):
         ephemeral=True
     )
 
-async def get_nekos_gif(action: str) -> str:
+async def get_waifu_gif(action: str) -> str | None:
+    """Get GIF from nekos.best API with proper error handling and retry mechanism"""
     url = f"https://nekos.best/api/v2/{action}"
-
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            data = await resp.json()
-            return data["results"][0]["url"]
+    
+    # Proper User-Agent as required by NEKOSBEST documentation
+    headers = {
+        "User-Agent": "VoorheesBot (conchochu4@gmail.com)",
+        "Accept": "application/json"
+    }
+    
+    max_retries = 3
+    retry_delay = 2  # seconds
+    
+    for attempt in range(max_retries):
+        try:
+            print(f"[NEKOS API] Attempt {attempt + 1}/{max_retries}: GET {url}")
+            print(f"[NEKOS API] User-Agent: {headers['User-Agent']}")
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url, 
+                    headers=headers, 
+                    timeout=aiohttp.ClientTimeout(total=15)
+                ) as resp:
+                    print(f"[NEKOS API] Status: {resp.status}")
+                    print(f"[NEKOS API] Content-Type: {resp.headers.get('Content-Type', 'N/A')}")
+                    
+                    # Check status code
+                    if resp.status == 200:
+                        content_type = resp.headers.get('Content-Type', '')
+                        if 'application/json' not in content_type:
+                            print(f"[NEKOS API] ERROR: Unexpected Content-Type: {content_type}")
+                            print(f"[NEKOS API] Response text: {await resp.text()}")
+                            if attempt < max_retries - 1:
+                                await asyncio.sleep(retry_delay)
+                                continue
+                            return None
+                        
+                        data = await resp.json()
+                        gif_url = data["results"][0]["url"]
+                        print(f"[NEKOS API] SUCCESS: Got GIF URL")
+                        return gif_url
+                    
+                    elif resp.status == 403:
+                        error_text = await resp.text()
+                        print(f"[NEKOS API] ERROR 403 Forbidden: {error_text}")
+                        return None
+                    
+                    elif resp.status == 404:
+                        print(f"[NEKOS API] ERROR 404: Action '{action}' not found")
+                        return None
+                    
+                    elif resp.status == 429:
+                        print(f"[NEKOS API] ERROR 429: Rate limited, retrying in {retry_delay}s...")
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(retry_delay)
+                            continue
+                        return None
+                    
+                    elif resp.status >= 500:
+                        print(f"[NEKOS API] ERROR {resp.status}: Server error")
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(retry_delay)
+                            continue
+                        return None
+                    
+                    else:
+                        print(f"[NEKOS API] ERROR {resp.status}: Unexpected status")
+                        return None
+        
+        except aiohttp.ClientConnectorError as e:
+            print(f"[NEKOS API] Connection error: {str(e)}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(retry_delay)
+                continue
+            return None
+        
+        except asyncio.TimeoutError:
+            print(f"[NEKOS API] Timeout error")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(retry_delay)
+                continue
+            return None
+        
+        except Exception as e:
+            print(f"[NEKOS API] Unexpected error: {str(e)}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(retry_delay)
+                continue
+            return None
+    
+    print(f"[NEKOS API] FAILED: All {max_retries} attempts exhausted")
+    return None
 
 @client.tree.command(
     name="skip",
@@ -2170,7 +3864,7 @@ async def seek(interaction: discord.Interaction, time: str):
                 state["current"],
                 start_time=seek_time,
                 after=after_seek,
-                refresh=False
+                download=False
             )
 
             state["playing"] = True
@@ -2223,7 +3917,13 @@ async def kiss(interaction: discord.Interaction, member: discord.Member):
         )
         return
 
-    gif_url = await get_nekos_gif("kiss")
+    gif_url = await get_waifu_gif("kiss")
+    if gif_url is None:
+        await interaction.response.send_message(
+            "❌ Không thể lấy GIF từ API. Vui lòng thử lại sau.",
+            ephemeral=True
+        )
+        return
 
     if member.id == interaction.user.id:
         description = f"{interaction.user.mention} tự ôm lấy chính mình 😳"
@@ -2261,7 +3961,13 @@ async def slap(interaction: discord.Interaction, member: discord.Member):
         )
         return
 
-    gif_url = await get_nekos_gif("slap")
+    gif_url = await get_waifu_gif("slap")
+    if gif_url is None:
+        await interaction.response.send_message(
+            "❌ Không thể lấy GIF từ API. Vui lòng thử lại sau.",
+            ephemeral=True
+        )
+        return
 
     if member.id == interaction.user.id:
         description = f"{interaction.user.mention} tự tát mình... bình tĩnh nào 😅"
@@ -2299,7 +4005,13 @@ async def hug(interaction: discord.Interaction, member: discord.Member):
         )
         return
 
-    gif_url = await get_nekos_gif("hug")
+    gif_url = await get_waifu_gif("hug")
+    if gif_url is None:
+        await interaction.response.send_message(
+            "❌ Không thể lấy GIF từ API. Vui lòng thử lại sau.",
+            ephemeral=True
+        )
+        return
 
     if member.id == interaction.user.id:
         description = f"{interaction.user.mention} tự ôm lấy mình 🤍"
@@ -2337,7 +4049,13 @@ async def baka(interaction: discord.Interaction, member: discord.Member):
         )
         return
 
-    gif_url = await get_nekos_gif("baka")  # ⚠️ dùng baka thay cho silent
+    gif_url = await get_waifu_gif("baka")
+    if gif_url is None:
+        await interaction.response.send_message(
+            "❌ Không thể lấy GIF từ API. Vui lòng thử lại sau.",
+            ephemeral=True
+        )
+        return
 
     if member.id == interaction.user.id:
         description = f"{interaction.user.mention} tự nói mình là đồ ngốc 🤐"
@@ -2378,7 +4096,13 @@ async def laugh(interaction: discord.Interaction, member: discord.Member):
         )
         return
 
-    gif_url = await get_nekos_gif("laugh")
+    gif_url = await get_waifu_gif("laugh")
+    if gif_url is None:
+        await interaction.response.send_message(
+            "❌ Không thể lấy GIF từ API. Vui lòng thử lại sau.",
+            ephemeral=True
+        )
+        return
 
     if member.id == interaction.user.id:
         description = f"{interaction.user.mention} tự cười chính mình 🤭"
@@ -2416,7 +4140,13 @@ async def stare(interaction: discord.Interaction, member: discord.Member):
         )
         return
 
-    gif_url = await get_nekos_gif("stare")
+    gif_url = await get_waifu_gif("stare")
+    if gif_url is None:
+        await interaction.response.send_message(
+            "❌ Không thể lấy GIF từ API. Vui lòng thử lại sau.",
+            ephemeral=True
+        )
+        return
 
     if member.id == interaction.user.id:
         description = f"{interaction.user.mention} tự nhìn chằm chằm vào bản thân... 🤨"
@@ -2454,7 +4184,13 @@ async def poke(interaction: discord.Interaction, member: discord.Member):
         )
         return
 
-    gif_url = await get_nekos_gif("poke")
+    gif_url = await get_waifu_gif("poke")
+    if gif_url is None:
+        await interaction.response.send_message(
+            "❌ Không thể lấy GIF từ API. Vui lòng thử lại sau.",
+            ephemeral=True
+        )
+        return
 
     if member.id == interaction.user.id:
         description = f"{interaction.user.mention} tự chọc mình... có chuyện gì vậy? 😅"
@@ -2667,8 +4403,7 @@ async def process_unified_ai_logic(message: discord.Message, prefix: str):
         response_text = None
         for attempt in range(max_retries):
             try:
-                response = await asyncio.to_thread(
-                    gemini_client.models.generate_content,
+                response = await gemini_client.aio.models.generate_content(
                     model=GEMINI_MODEL,
                     contents=full_prompt
                 )
@@ -2681,7 +4416,7 @@ async def process_unified_ai_logic(message: discord.Message, prefix: str):
                     await asyncio.sleep(2 * (attempt + 1))
                     continue
                 
-                error_msg = "❌ AI gặp lỗi không xác định."
+                error_msg = f"❌ AI gặp lỗi không xác định: {err}"
                 if "RESOURCE_EXHAUSTED" in err or "429" in err:
                     error_msg = "🚫 **AI đã hết giới hạn request hôm nay.**"
                 elif "503" in err or "UNAVAILABLE" in err:
@@ -2732,7 +4467,7 @@ async def handle_ai_message(message: discord.Message):
     if message.channel.id not in {AI_TEMPLATE_CHANNEL_ID, state["current_channel_id"]}:
         return
 
-    if not message.content.startswith(AI_KEYWORD):
+    if not message.content.lower().startswith(AI_KEYWORD.lower()):
         return
 
     if not remember_processed_message(message.id, processed_ai_message_ids):
@@ -2979,15 +4714,42 @@ async def check_inactive_users(guild: discord.Guild):
 
         inactive_duration = now - last_active
         if inactive_duration >= timedelta(days=30):
-            try:
-                for reaction in msg.reactions:
-                    async for user in reaction.users():
-                        if user.id == user_id:
-                            await msg.remove_reaction(reaction.emoji, member)
+            # Kiểm tra lại lịch sử chat trước khi quyết định xoá
+            last_time_live = None
+            for txt_channel in guild.text_channels:
+                perms = txt_channel.permissions_for(guild.me)
+                if not perms.read_message_history or not perms.read_messages:
+                    continue
+                try:
+                    async for msg_hist in txt_channel.history(limit=500):
+                        if msg_hist.author.id == user_id:
+                            if not last_time_live or msg_hist.created_at > last_time_live:
+                                last_time_live = msg_hist.created_at
+                            break
+                except Exception:
+                    continue
+            
+            if last_time_live:
+                last_time_live_naive = last_time_live.replace(tzinfo=None)
+                if last_time_live_naive > last_active:
+                    last_active = last_time_live_naive
+                    activity_data[user_id_str] = last_active.isoformat()
+                    save_user_activity(activity_data)
+                    inactive_duration = now - last_active
+
+            if inactive_duration >= timedelta(days=30):
+                try:
+                    for reaction in msg.reactions:
+                        async for user in reaction.users():
+                            if user.id == user_id:
+                                await msg.remove_reaction(reaction.emoji, member)
+                    users_to_remove.append(user_id_str)
+                    print(f"[INACTIVE CHECK] Đã xoá reaction của {member} vì inactive > 30 ngày.")
+                except Exception as e:
+                    print(f"[INACTIVE CHECK] Lỗi khi xoá reaction của {member}: {e}")
+            else:
                 users_to_remove.append(user_id_str)
-                print(f"[INACTIVE CHECK] Đã xoá reaction của {member} vì inactive > 30 ngày.")
-            except Exception as e:
-                print(f"[INACTIVE CHECK] Lỗi khi xoá reaction của {member}: {e}")
+                print(f"[INACTIVE CHECK] Đã huỷ xoá reaction và gỡ {member} khỏi danh sách kiểm tra vì phát hiện có chat mới.")
 
     if users_to_remove:
         new_checked = [u for u in checked_users if u not in users_to_remove]
