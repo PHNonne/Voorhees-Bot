@@ -14,8 +14,15 @@ import re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import time
+import sys
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if getattr(sys, "frozen", False):
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+os.chdir(BASE_DIR)
+_local_ffmpeg = os.path.join(BASE_DIR, "ffmpeg.exe")
+FFMPEG_EXE = _local_ffmpeg if os.path.exists(_local_ffmpeg) else "ffmpeg"
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 BLACKLIST_FILE = os.path.join(BASE_DIR, "blacklist_words.txt")
 STEAM_LINKS_FILE = os.path.join(BASE_DIR, "steam_links.json")
@@ -987,7 +994,7 @@ async def talkgoogle(interaction: discord.Interaction, lang: str, text: str):
     # Phát file qua FFmpeg
     try:
         vc.play(discord.FFmpegPCMAudio(
-            executable="ffmpeg",
+            executable=FFMPEG_EXE,
             source=filename
         ))
 
@@ -1891,7 +1898,7 @@ async def play_song(vc, song, start_time=0, after=None, refresh=True):
     vc.play(
         discord.FFmpegPCMAudio(
             song["url"],
-            executable="ffmpeg",
+            executable=FFMPEG_EXE,
             before_options=before_options,
             options=options
         ),
@@ -3107,4 +3114,17 @@ async def checkstatus(interaction: discord.Interaction):
 if not BOT_TOKEN:
     raise RuntimeError("Thiếu DISCORD_BOT_TOKEN trong file .env.")
 
-client.run(BOT_TOKEN)
+if not BOT_TOKEN:
+    print(f"❌ Không tìm thấy DISCORD_BOT_TOKEN. Hãy đặt file .env cạnh bot: {BASE_DIR}")
+    if getattr(sys, "frozen", False):
+        input("Nhấn Enter để thoát...")
+    sys.exit(1)
+
+try:
+    client.run(BOT_TOKEN)
+except Exception:
+    if getattr(sys, "frozen", False):
+        import traceback
+        traceback.print_exc()
+        input("Nhấn Enter để thoát...")
+    raise
