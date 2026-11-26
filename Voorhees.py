@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import time
 import sys
+import shutil
 
 if getattr(sys, 'frozen', False):
     BASE_DIR = os.path.dirname(sys.executable)
@@ -22,6 +23,11 @@ if getattr(sys, 'frozen', False):
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     _MEIPASS = os.path.dirname(os.path.abspath(__file__))
+
+os.chdir(BASE_DIR)
+for _stream in (sys.stdout, sys.stderr):
+    if _stream and hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 sys.path.append(os.path.join(_MEIPASS, "modules"))
 import tts_piper
@@ -33,11 +39,27 @@ try:
 except ImportError:
     pass
 
-FFMPEG_EXECUTABLE = r"C:\BotDiscord\ffmpeg\bin\ffmpeg.exe"
+def find_executable(name: str, folder: str, legacy_path: str) -> str:
+    """Look next to the bot first (portable), then the legacy path, then PATH."""
+    exe = f"{name}.exe"
+    candidates = [
+        os.path.join(BASE_DIR, exe),
+        os.path.join(BASE_DIR, folder, "bin", exe),
+        os.path.join(BASE_DIR, folder, exe),
+        os.path.join(os.path.dirname(BASE_DIR), folder, "bin", exe),
+        os.path.join(os.path.dirname(BASE_DIR), folder, exe),
+        legacy_path,
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return shutil.which(name) or name
+
+FFMPEG_EXECUTABLE = find_executable("ffmpeg", "ffmpeg", r"C:\BotDiscord\ffmpeg\bin\ffmpeg.exe")
 print(f"[FFMPEG] Using executable: {FFMPEG_EXECUTABLE}")
 
 # yt-dlp executable
-YTDLP_EXECUTABLE = r"C:\BotDiscord\yt-dlp\yt-dlp.exe"
+YTDLP_EXECUTABLE = find_executable("yt-dlp", "yt-dlp", r"C:\BotDiscord\yt-dlp\yt-dlp.exe")
 print(f"[YTDLP] Using executable: {YTDLP_EXECUTABLE}")
 
 # Music cache directory
@@ -415,8 +437,9 @@ async def handle_voice_command(message: discord.Message, text: str):
         return
     
     guild_id = message.guild.id
-    if guild_id in music_playing or guild_id in tts_playing:
-        await message.channel.send("❌ Bot đang phát nhạc hoặc đọc TTS.", delete_after=20)
+    busy = bot_audio_busy(message.guild)
+    if busy:
+        await message.channel.send(f"❌ {busy}. Đợi phát xong rồi thử lại.", delete_after=20)
         try:
             await message.delete(delay=20)
         except Exception:
@@ -451,6 +474,10 @@ async def handle_voice_command(message: discord.Message, text: str):
         await message.channel.send(f"❌ Lỗi khi tạo âm thanh: {str(e)}", delete_after=10)
         return
     
+    busy = bot_audio_busy(message.guild)
+    if busy:
+        await message.channel.send(f"❌ {busy}. Đợi phát xong rồi thử lại.", delete_after=20)
+        return
     tts_playing.add(guild_id)
     
     # Gửi embed công khai
@@ -531,8 +558,9 @@ async def handle_google_command(message: discord.Message, text: str):
         return
     
     guild_id = message.guild.id
-    if guild_id in music_playing or guild_id in tts_playing:
-        await message.channel.send("❌ Bot đang phát nhạc hoặc đọc TTS.", delete_after=20)
+    busy = bot_audio_busy(message.guild)
+    if busy:
+        await message.channel.send(f"❌ {busy}. Đợi phát xong rồi thử lại.", delete_after=20)
         try:
             await message.delete(delay=20)
         except Exception:
@@ -569,6 +597,10 @@ async def handle_google_command(message: discord.Message, text: str):
         await message.channel.send(f"❌ Ngôn ngữ `{lang}` không được hỗ trợ.", delete_after=10)
         return
     
+    busy = bot_audio_busy(message.guild)
+    if busy:
+        await message.channel.send(f"❌ {busy}. Đợi phát xong rồi thử lại.", delete_after=20)
+        return
     tts_playing.add(guild_id)
     
     # Gửi embed công khai
@@ -1935,6 +1967,18 @@ async def talkgoogle(interaction: discord.Interaction, lang: str):
             pass
         return
 
+    # Không cho dùng khi bot đang phát âm thanh
+    busy = bot_audio_busy(interaction.guild)
+    if busy:
+        try:
+            await interaction.response.send_message(
+                f"❌ {busy}. Đợi phát xong rồi thử lại.",
+                ephemeral=True
+            )
+        except Exception:
+            pass
+        return
+
     # Kiểm tra user có ở voice không
     if not interaction.user.voice or not interaction.user.voice.channel:
         try:
@@ -2057,6 +2101,18 @@ async def talkvoice(interaction: discord.Interaction, language: str, voice: str)
         try:
             await interaction.response.send_message(
                 "❌ Bạn không có quyền dùng lệnh này.",
+                ephemeral=True
+            )
+        except Exception:
+            pass
+        return
+
+    # Không cho dùng khi bot đang phát âm thanh
+    busy = bot_audio_busy(interaction.guild)
+    if busy:
+        try:
+            await interaction.response.send_message(
+                f"❌ {busy}. Đợi phát xong rồi thử lại.",
                 ephemeral=True
             )
         except Exception:
@@ -2898,6 +2954,22 @@ async def ensure_music_channel(interaction: discord.Interaction) -> bool:
 music_state = {}
 music_playing = set()   # guild_id đang phát YouTube
 
+
+def bot_audio_busy(guild) -> str | None:
+    """Trả về lý do nếu bot đang phát âm thanh (nhạc hoặc TTS), None nếu đang rảnh."""
+    guild_id = guild.id
+    if guild_id in tts_playing:
+        return "Bot đang đọc TTS (!voice / !google)"
+    vc = discord.utils.get(client.voice_clients, guild=guild)
+    if not vc or not vc.is_connected():
+        return None
+    state = music_state.get(guild_id)
+    if guild_id in music_playing or (state and state.get("playing")):
+        return "Bot đang phát nhạc (/play)"
+    if vc.is_playing() or vc.is_paused():
+        return "Bot đang phát âm thanh"
+    return None
+
 def format_duration(seconds: int) -> str:
     seconds = int(seconds or 0)
     h, remainder = divmod(seconds, 3600)
@@ -2929,71 +3001,50 @@ def build_song_info(info: dict, source_url: str, file_path: str = None) -> dict:
         "http_headers": info.get("http_headers") or {}
     }
 
+def ytdlp_common_args() -> list:
+    args = ["--no-playlist", "--no-check-certificate", "--no-warnings"]
+    if os.path.isfile(FFMPEG_EXECUTABLE):
+        args += ["--ffmpeg-location", FFMPEG_EXECUTABLE]
+    return args
+
+YTDLP_CLIENT_FALLBACKS = [
+    [],
+    ["--extractor-args", "youtube:player_client=default,web_safari"],
+    ["--extractor-args", "youtube:player_client=tv,web_embedded"],
+]
+
 def extract_song_info(url: str) -> dict:
-    """Extract song info using yt-dlp.exe with fallback methods"""
+    """Extract song info using yt-dlp.exe; accepts a link or search keywords."""
     import subprocess
     import json
-    
-    # Build base command
-    def build_cmd(extra_args=[]):
-        cmd = [
-            YTDLP_EXECUTABLE,
-            "--dump-json",
-            "--no-playlist",
-            "--no-check-certificate",
-            "--ignore-errors",
-            "--extract-flat", "false",
-            "--no-warnings",
-            url
-        ]
-        cmd.extend(extra_args)
-        return cmd
-    
-    # Try primary extraction
-    try:
-        cmd = build_cmd([
-            "--extractor-args", "youtube:player_client=android,android_music,web",
-            "--extractor-args", "youtube:player_skip=js,configs,age_gate",
-            "--extractor-args", "youtube:age_gate=False",
-        ])
+
+    query = url.strip()
+    if not re.match(r"^https?://", query):
+        if re.match(r"^[\w.-]+\.[a-z]{2,}/\S*$", query, re.IGNORECASE):
+            query = f"https://{query}"
+        else:
+            query = f"ytsearch1:{query}"
+
+    last_error = "unknown error"
+    for extra in YTDLP_CLIENT_FALLBACKS:
+        cmd = [YTDLP_EXECUTABLE, "--dump-json", *ytdlp_common_args(), *extra, query]
         print(f"[EXTRACT] Running: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if result.returncode == 0:
-            info = json.loads(result.stdout)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
+        except FileNotFoundError:
+            raise RuntimeError(f"Không tìm thấy yt-dlp: {YTDLP_EXECUTABLE}")
+        except subprocess.TimeoutExpired:
+            last_error = "timeout"
+            continue
+        lines = [line for line in result.stdout.splitlines() if line.strip().startswith("{")]
+        if result.returncode == 0 and lines:
+            info = json.loads(lines[0])
             video_id = info.get("id", "")
             file_path = os.path.join(MUSIC_CACHE_DIR, f"{video_id}.mp3")
             return build_song_info(info, url, file_path)
-    except Exception as e:
-        print(f"[EXTRACT] Primary extraction failed: {e}")
-    
-    # Fallback 1: Simpler options
-    try:
-        cmd = build_cmd([
-            "--extractor-args", "youtube:player_client=android",
-        ])
-        print(f"[EXTRACT] Fallback 1: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if result.returncode == 0:
-            info = json.loads(result.stdout)
-            video_id = info.get("id", "")
-            file_path = os.path.join(MUSIC_CACHE_DIR, f"{video_id}.mp3")
-            return build_song_info(info, url, file_path)
-    except Exception as e:
-        print(f"[EXTRACT] Fallback 1 failed: {e}")
-    
-    # Fallback 2: Minimal options
-    try:
-        cmd = build_cmd([])
-        print(f"[EXTRACT] Fallback 2: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if result.returncode == 0:
-            info = json.loads(result.stdout)
-            video_id = info.get("id", "")
-            file_path = os.path.join(MUSIC_CACHE_DIR, f"{video_id}.mp3")
-            return build_song_info(info, url, file_path)
-    except Exception as e:
-        print(f"[EXTRACT] Fallback 2 failed: {e}")
-        raise
+        last_error = (result.stderr or "").strip()[-500:] or f"exit code {result.returncode}"
+        print(f"[EXTRACT] Failed: {last_error}")
+    raise RuntimeError(last_error)
 
 def download_song(song: dict) -> bool:
     """Download YouTube audio to local MP3 file using yt-dlp.exe with fallback methods"""
@@ -3019,79 +3070,35 @@ def download_song(song: dict) -> bool:
 
     print(f"[DOWNLOAD] Downloading {video_id} to {file_path}")
     
-    # Build base command
-    def build_cmd(extra_args=[]):
+    for extra in YTDLP_CLIENT_FALLBACKS:
         cmd = [
             YTDLP_EXECUTABLE,
             "--format", "bestaudio/best",
             "--extract-audio",
             "--audio-format", "mp3",
             "--audio-quality", "192K",
-            "--no-playlist",
-            "--no-check-certificate",
-            "--ignore-errors",
-            "--extract-flat", "false",
-            "--no-warnings",
-            "--output", os.path.join(MUSIC_CACHE_DIR, "%(id)s.%(ext)s"),
-            source_url
-        ]
-        cmd.extend(extra_args)
-        return cmd
-    
-    # Try primary download
-    try:
-        cmd = build_cmd([
-            "--extractor-args", "youtube:player_client=android,android_music,web",
-            "--extractor-args", "youtube:player_skip=js,configs,age_gate",
-            "--extractor-args", "youtube:age_gate=False",
             "--retries", "5",
             "--fragment-retries", "5",
-        ])
+            "--output", os.path.join(MUSIC_CACHE_DIR, "%(id)s.%(ext)s"),
+            *ytdlp_common_args(),
+            *extra,
+            source_url,
+        ]
         print(f"[DOWNLOAD] Running: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode == 0:
-            if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
-                print(f"[DOWNLOAD] Successfully downloaded: {file_path}")
-                song["file_path"] = file_path
-                return True
-            else:
-                print(f"[DOWNLOAD] File not created or empty: {file_path}")
-        else:
-            print(f"[DOWNLOAD] Primary download failed with code {result.returncode}")
-            print(f"[DOWNLOAD] stderr: {result.stderr}")
-    except Exception as e:
-        print(f"[DOWNLOAD] Primary download failed: {e}")
-    
-    # Fallback 1: Simpler options
-    try:
-        print(f"[DOWNLOAD] Trying fallback 1...")
-        cmd = build_cmd([
-            "--extractor-args", "youtube:player_client=android",
-        ])
-        print(f"[DOWNLOAD] Fallback 1: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode == 0:
-            if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
-                print(f"[DOWNLOAD] Fallback 1 succeeded: {file_path}")
-                song["file_path"] = file_path
-                return True
-    except Exception as e:
-        print(f"[DOWNLOAD] Fallback 1 failed: {e}")
-    
-    # Fallback 2: Minimal options
-    try:
-        print(f"[DOWNLOAD] Trying fallback 2...")
-        cmd = build_cmd([])
-        print(f"[DOWNLOAD] Fallback 2: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode == 0:
-            if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
-                print(f"[DOWNLOAD] Fallback 2 succeeded: {file_path}")
-                song["file_path"] = file_path
-                return True
-    except Exception as e:
-        print(f"[DOWNLOAD] Fallback 2 failed: {e}")
-    
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
+        except FileNotFoundError:
+            print(f"[DOWNLOAD] yt-dlp not found: {YTDLP_EXECUTABLE}")
+            return False
+        except subprocess.TimeoutExpired:
+            print("[DOWNLOAD] Timeout")
+            continue
+        if result.returncode == 0 and os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+            print(f"[DOWNLOAD] Successfully downloaded: {file_path}")
+            song["file_path"] = file_path
+            return True
+        print(f"[DOWNLOAD] Failed with code {result.returncode}: {(result.stderr or '').strip()[-500:]}")
+
     # All methods failed - clean up partial file
     if os.path.exists(file_path):
         try:
@@ -3101,6 +3108,23 @@ def download_song(song: dict) -> bool:
             print(f"[DOWNLOAD] Error cleaning up partial file: {cleanup_error}")
     
     return False
+
+def clear_music_cache() -> int:
+    """Xoá toàn bộ file .mp3 trong music_cache, trả về số file đã xoá."""
+    deleted = 0
+    if not os.path.isdir(MUSIC_CACHE_DIR):
+        return deleted
+    for filename in os.listdir(MUSIC_CACHE_DIR):
+        if not filename.lower().endswith(".mp3"):
+            continue
+        file_path = os.path.join(MUSIC_CACHE_DIR, filename)
+        try:
+            os.remove(file_path)
+            deleted += 1
+        except Exception as e:
+            print(f"[CLEAR CACHE] Không xoá được {filename}: {e}")
+    print(f"[CLEAR CACHE] Đã xoá {deleted} file mp3")
+    return deleted
 
 def cleanup_old_cache_files(max_age_hours: int = 168):
     """Remove cache files older than max_age_hours (default 7 days)"""
@@ -3174,7 +3198,7 @@ def parse_seek_time(value: str) -> int:
     description="Phát nhạc từ YouTube (chỉ âm thanh)",
     guild=discord.Object(id=GUILD_ID)
 )
-@app_commands.describe(url="Link YouTube")
+@app_commands.describe(url="Link YouTube hoặc tên bài hát")
 async def play(interaction: discord.Interaction, url: str):
 
     # 🔒 Kiểm tra role
@@ -3191,10 +3215,11 @@ async def play(interaction: discord.Interaction, url: str):
 
     guild_id = interaction.guild.id
 
-    # ❌ Nếu đang TTS → chặn
-    if guild_id in tts_playing:
+    # ❌ Nếu đang TTS hoặc âm thanh khác → chặn (nhạc đang phát thì cho thêm vào queue)
+    busy = bot_audio_busy(interaction.guild)
+    if busy and busy != "Bot đang phát nhạc (/play)":
         await interaction.response.send_message(
-            "❌ Bot đang đọc talkgoogle. Không thể phát nhạc lúc này.",
+            f"❌ {busy}. Không thể phát nhạc lúc này.",
             ephemeral=True
         )
         return
@@ -3217,14 +3242,30 @@ async def play(interaction: discord.Interaction, url: str):
     print(f"[PLAY] Current VC: {vc}")
     print(f"[PLAY] VC connected: {vc.is_connected() if vc else 'N/A'}")
 
-    if not vc:
-        print("[PLAY] Connecting to voice channel...")
-        vc = await voice_channel.connect()
-        print(f"[PLAY] Connected successfully: {vc}")
-    elif vc.channel != voice_channel:
-        print("[PLAY] Moving to voice channel...")
-        await vc.move_to(voice_channel)
-        print(f"[PLAY] Moved successfully")
+    perms = voice_channel.permissions_for(interaction.guild.me)
+    if not perms.connect or not perms.speak:
+        await interaction.followup.send(
+            f"❌ Bot thiếu quyền Connect/Speak ở kênh **{voice_channel.name}**.",
+            ephemeral=True
+        )
+        return
+
+    try:
+        if not vc or not vc.is_connected():
+            print("[PLAY] Connecting to voice channel...")
+            vc = await voice_channel.connect(timeout=30, reconnect=True, self_deaf=True)
+            print(f"[PLAY] Connected successfully: {vc}")
+        elif vc.channel != voice_channel:
+            print("[PLAY] Moving to voice channel...")
+            await vc.move_to(voice_channel)
+            print(f"[PLAY] Moved successfully")
+    except Exception as e:
+        print(f"[PLAY] Voice connect error: {e!r}")
+        await interaction.followup.send(
+            "❌ Không kết nối được vào voice channel. Thử lại sau vài giây.",
+            ephemeral=True
+        )
+        return
 
     state["voice"] = vc
 
@@ -3249,18 +3290,29 @@ async def play(interaction: discord.Interaction, url: str):
             return
 
         # ▶️ CHƯA PHÁT → PHÁT
+        await interaction.followup.send(
+            f"⏳ Đang tải: **{song['title']}**...",
+            ephemeral=True
+        )
         state["queue"].insert(0, song)
         await play_next(interaction.guild)
 
-        await interaction.followup.send(
-            f"🎵 Đang phát: **{song['title']}**\n"
-            f"⏱️ Duration: **{song['duration_text']}**",
-            ephemeral=True
-        )
+        if state.get("current") is song and (vc.is_playing() or vc.is_paused()):
+            await interaction.followup.send(
+                f"🎵 Đang phát: **{song['title']}**\n"
+                f"⏱️ Duration: **{song['duration_text']}**",
+                ephemeral=True
+            )
+        else:
+            await interaction.followup.send(
+                f"❌ Không tải/phát được: **{song['title']}**",
+                ephemeral=True
+            )
 
-    except Exception:
+    except Exception as e:
+        print(f"[PLAY] Error: {e!r}")
         await interaction.followup.send(
-            "❌ Không thể phát video này.",
+            f"❌ Không thể phát video này.\n`{str(e)[:300]}`",
             ephemeral=True
         )
 
@@ -3320,12 +3372,28 @@ async def stop(interaction: discord.Interaction):
     if not await ensure_music_channel(interaction):
         return
 
+    await interaction.response.defer(ephemeral=True)
     vc = discord.utils.get(client.voice_clients, guild=interaction.guild)
     if vc:
+        state = get_music_state(interaction.guild.id)
+        state["queue"].clear()
+        state["replay"] = False
+        state["playing"] = False
+        state["current"] = None
+        music_playing.discard(interaction.guild.id)
         await vc.disconnect()
-        await interaction.response.send_message("⏹️ Đã dừng và rời voice", ephemeral=True)
+        await asyncio.sleep(1)  # đợi FFmpeg nhả file mp3
+        deleted = clear_music_cache()
+        await interaction.followup.send(
+            f"⏹️ Đã dừng, rời voice và xoá {deleted} file nhạc trong cache.",
+            ephemeral=True
+        )
     else:
-        await interaction.response.send_message("❌ Bot không ở voice.", ephemeral=True)
+        deleted = clear_music_cache()
+        await interaction.followup.send(
+            f"❌ Bot không ở voice. Đã xoá {deleted} file nhạc trong cache.",
+            ephemeral=True
+        )
 
 def get_music_state(guild_id: int):
     if guild_id not in music_state:
@@ -3387,7 +3455,6 @@ async def play_next(guild: discord.Guild):
             traceback.print_exc()
 
         print("[AFTER_MUSIC] Song finished, playing next")
-        music_playing.discard(guild_id)
         state["playing"] = False
 
         # 🔁 Replay
@@ -3412,7 +3479,8 @@ async def play_next(guild: discord.Guild):
         if state.get("play_id") == play_id:
             state["playing"] = False
             music_playing.discard(guild_id)
-            asyncio.create_task(play_next(guild))
+            if state["queue"]:
+                asyncio.create_task(play_next(guild))
 async def play_song(vc, song, start_time=0, after=None, download=True):
     print("[FFMPEG DEBUG] Executable:", FFMPEG_EXECUTABLE)
     print("[FFMPEG DEBUG] Exists:", os.path.isfile(FFMPEG_EXECUTABLE))
@@ -3472,6 +3540,10 @@ async def play_song(vc, song, start_time=0, after=None, download=True):
 )
 async def testaudio(interaction: discord.Interaction):
     """Test command để kiểm tra xem bot có thể phát âm thanh được không"""
+    busy = bot_audio_busy(interaction.guild)
+    if busy:
+        await interaction.response.send_message(f"❌ {busy}. Đợi phát xong rồi thử lại.", ephemeral=True)
+        return
     if not interaction.user.voice or not interaction.user.voice.channel:
         await interaction.response.send_message("❌ Bạn phải vào voice channel trước.", ephemeral=True)
         return
@@ -4877,6 +4949,16 @@ async def checkstatus(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 if not BOT_TOKEN:
-    raise RuntimeError("Thiếu DISCORD_BOT_TOKEN trong file .env.")
+    print(f"❌ Không tìm thấy DISCORD_BOT_TOKEN. Hãy đặt file .env cạnh bot: {BASE_DIR}")
+    if getattr(sys, "frozen", False):
+        input("Nhấn Enter để thoát...")
+    sys.exit(1)
 
-client.run(BOT_TOKEN)
+try:
+    client.run(BOT_TOKEN)
+except Exception:
+    if getattr(sys, "frozen", False):
+        import traceback
+        traceback.print_exc()
+        input("Nhấn Enter để thoát...")
+    raise
