@@ -3059,6 +3059,23 @@ def download_song(song: dict) -> bool:
     
     return False
 
+def clear_music_cache() -> int:
+    """Xoá toàn bộ file .mp3 trong music_cache, trả về số file đã xoá."""
+    deleted = 0
+    if not os.path.isdir(MUSIC_CACHE_DIR):
+        return deleted
+    for filename in os.listdir(MUSIC_CACHE_DIR):
+        if not filename.lower().endswith(".mp3"):
+            continue
+        file_path = os.path.join(MUSIC_CACHE_DIR, filename)
+        try:
+            os.remove(file_path)
+            deleted += 1
+        except Exception as e:
+            print(f"[CLEAR CACHE] Không xoá được {filename}: {e}")
+    print(f"[CLEAR CACHE] Đã xoá {deleted} file mp3")
+    return deleted
+
 def cleanup_old_cache_files(max_age_hours: int = 168):
     """Remove cache files older than max_age_hours (default 7 days)"""
     if not os.path.exists(MUSIC_CACHE_DIR):
@@ -3304,6 +3321,7 @@ async def stop(interaction: discord.Interaction):
     if not await ensure_music_channel(interaction):
         return
 
+    await interaction.response.defer(ephemeral=True)
     vc = discord.utils.get(client.voice_clients, guild=interaction.guild)
     if vc:
         state = get_music_state(interaction.guild.id)
@@ -3313,9 +3331,18 @@ async def stop(interaction: discord.Interaction):
         state["current"] = None
         music_playing.discard(interaction.guild.id)
         await vc.disconnect()
-        await interaction.response.send_message("⏹️ Đã dừng và rời voice", ephemeral=True)
+        await asyncio.sleep(1)  # đợi FFmpeg nhả file mp3
+        deleted = clear_music_cache()
+        await interaction.followup.send(
+            f"⏹️ Đã dừng, rời voice và xoá {deleted} file nhạc trong cache.",
+            ephemeral=True
+        )
     else:
-        await interaction.response.send_message("❌ Bot không ở voice.", ephemeral=True)
+        deleted = clear_music_cache()
+        await interaction.followup.send(
+            f"❌ Bot không ở voice. Đã xoá {deleted} file nhạc trong cache.",
+            ephemeral=True
+        )
 
 def get_music_state(guild_id: int):
     if guild_id not in music_state:
