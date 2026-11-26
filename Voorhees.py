@@ -2964,7 +2964,6 @@ def extract_song_info(url: str) -> dict:
             "--no-playlist",
             "--no-check-certificate",
             "--ignore-errors",
-            "--extract-flat", "false",
             "--no-warnings",
             url
         ]
@@ -3052,7 +3051,6 @@ def download_song(song: dict) -> bool:
             "--no-playlist",
             "--no-check-certificate",
             "--ignore-errors",
-            "--extract-flat", "false",
             "--no-warnings",
             "--output", os.path.join(MUSIC_CACHE_DIR, "%(id)s.%(ext)s"),
             source_url
