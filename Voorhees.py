@@ -437,8 +437,9 @@ async def handle_voice_command(message: discord.Message, text: str):
         return
     
     guild_id = message.guild.id
-    if guild_id in music_playing or guild_id in tts_playing:
-        await message.channel.send("❌ Bot đang phát nhạc hoặc đọc TTS.", delete_after=20)
+    busy = bot_audio_busy(message.guild)
+    if busy:
+        await message.channel.send(f"❌ {busy}. Đợi phát xong rồi thử lại.", delete_after=20)
         try:
             await message.delete(delay=20)
         except Exception:
@@ -473,6 +474,10 @@ async def handle_voice_command(message: discord.Message, text: str):
         await message.channel.send(f"❌ Lỗi khi tạo âm thanh: {str(e)}", delete_after=10)
         return
     
+    busy = bot_audio_busy(message.guild)
+    if busy:
+        await message.channel.send(f"❌ {busy}. Đợi phát xong rồi thử lại.", delete_after=20)
+        return
     tts_playing.add(guild_id)
     
     # Gửi embed công khai
@@ -553,8 +558,9 @@ async def handle_google_command(message: discord.Message, text: str):
         return
     
     guild_id = message.guild.id
-    if guild_id in music_playing or guild_id in tts_playing:
-        await message.channel.send("❌ Bot đang phát nhạc hoặc đọc TTS.", delete_after=20)
+    busy = bot_audio_busy(message.guild)
+    if busy:
+        await message.channel.send(f"❌ {busy}. Đợi phát xong rồi thử lại.", delete_after=20)
         try:
             await message.delete(delay=20)
         except Exception:
@@ -591,6 +597,10 @@ async def handle_google_command(message: discord.Message, text: str):
         await message.channel.send(f"❌ Ngôn ngữ `{lang}` không được hỗ trợ.", delete_after=10)
         return
     
+    busy = bot_audio_busy(message.guild)
+    if busy:
+        await message.channel.send(f"❌ {busy}. Đợi phát xong rồi thử lại.", delete_after=20)
+        return
     tts_playing.add(guild_id)
     
     # Gửi embed công khai
@@ -1957,6 +1967,18 @@ async def talkgoogle(interaction: discord.Interaction, lang: str):
             pass
         return
 
+    # Không cho dùng khi bot đang phát âm thanh
+    busy = bot_audio_busy(interaction.guild)
+    if busy:
+        try:
+            await interaction.response.send_message(
+                f"❌ {busy}. Đợi phát xong rồi thử lại.",
+                ephemeral=True
+            )
+        except Exception:
+            pass
+        return
+
     # Kiểm tra user có ở voice không
     if not interaction.user.voice or not interaction.user.voice.channel:
         try:
@@ -2079,6 +2101,18 @@ async def talkvoice(interaction: discord.Interaction, language: str, voice: str)
         try:
             await interaction.response.send_message(
                 "❌ Bạn không có quyền dùng lệnh này.",
+                ephemeral=True
+            )
+        except Exception:
+            pass
+        return
+
+    # Không cho dùng khi bot đang phát âm thanh
+    busy = bot_audio_busy(interaction.guild)
+    if busy:
+        try:
+            await interaction.response.send_message(
+                f"❌ {busy}. Đợi phát xong rồi thử lại.",
                 ephemeral=True
             )
         except Exception:
@@ -2920,6 +2954,22 @@ async def ensure_music_channel(interaction: discord.Interaction) -> bool:
 music_state = {}
 music_playing = set()   # guild_id đang phát YouTube
 
+
+def bot_audio_busy(guild) -> str | None:
+    """Trả về lý do nếu bot đang phát âm thanh (nhạc hoặc TTS), None nếu đang rảnh."""
+    guild_id = guild.id
+    if guild_id in tts_playing:
+        return "Bot đang đọc TTS (!voice / !google)"
+    vc = discord.utils.get(client.voice_clients, guild=guild)
+    if not vc or not vc.is_connected():
+        return None
+    state = music_state.get(guild_id)
+    if guild_id in music_playing or (state and state.get("playing")):
+        return "Bot đang phát nhạc (/play)"
+    if vc.is_playing() or vc.is_paused():
+        return "Bot đang phát âm thanh"
+    return None
+
 def format_duration(seconds: int) -> str:
     seconds = int(seconds or 0)
     h, remainder = divmod(seconds, 3600)
@@ -3165,10 +3215,11 @@ async def play(interaction: discord.Interaction, url: str):
 
     guild_id = interaction.guild.id
 
-    # ❌ Nếu đang TTS → chặn
-    if guild_id in tts_playing:
+    # ❌ Nếu đang TTS hoặc âm thanh khác → chặn (nhạc đang phát thì cho thêm vào queue)
+    busy = bot_audio_busy(interaction.guild)
+    if busy and busy != "Bot đang phát nhạc (/play)":
         await interaction.response.send_message(
-            "❌ Bot đang đọc talkgoogle. Không thể phát nhạc lúc này.",
+            f"❌ {busy}. Không thể phát nhạc lúc này.",
             ephemeral=True
         )
         return
@@ -3404,7 +3455,6 @@ async def play_next(guild: discord.Guild):
             traceback.print_exc()
 
         print("[AFTER_MUSIC] Song finished, playing next")
-        music_playing.discard(guild_id)
         state["playing"] = False
 
         # 🔁 Replay
@@ -3490,6 +3540,10 @@ async def play_song(vc, song, start_time=0, after=None, download=True):
 )
 async def testaudio(interaction: discord.Interaction):
     """Test command để kiểm tra xem bot có thể phát âm thanh được không"""
+    busy = bot_audio_busy(interaction.guild)
+    if busy:
+        await interaction.response.send_message(f"❌ {busy}. Đợi phát xong rồi thử lại.", ephemeral=True)
+        return
     if not interaction.user.voice or not interaction.user.voice.channel:
         await interaction.response.send_message("❌ Bạn phải vào voice channel trước.", ephemeral=True)
         return
