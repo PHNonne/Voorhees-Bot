@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import time
 import sys
+import shutil
 
 if getattr(sys, 'frozen', False):
     BASE_DIR = os.path.dirname(sys.executable)
@@ -22,6 +23,11 @@ if getattr(sys, 'frozen', False):
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     _MEIPASS = os.path.dirname(os.path.abspath(__file__))
+
+os.chdir(BASE_DIR)
+for _stream in (sys.stdout, sys.stderr):
+    if _stream and hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 sys.path.append(os.path.join(_MEIPASS, "modules"))
 import tts_piper
@@ -33,11 +39,27 @@ try:
 except ImportError:
     pass
 
-FFMPEG_EXECUTABLE = r"C:\BotDiscord\ffmpeg\bin\ffmpeg.exe"
+def find_executable(name: str, folder: str, legacy_path: str) -> str:
+    """Look next to the bot first (portable), then the legacy path, then PATH."""
+    exe = f"{name}.exe"
+    candidates = [
+        os.path.join(BASE_DIR, exe),
+        os.path.join(BASE_DIR, folder, "bin", exe),
+        os.path.join(BASE_DIR, folder, exe),
+        os.path.join(os.path.dirname(BASE_DIR), folder, "bin", exe),
+        os.path.join(os.path.dirname(BASE_DIR), folder, exe),
+        legacy_path,
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return shutil.which(name) or name
+
+FFMPEG_EXECUTABLE = find_executable("ffmpeg", "ffmpeg", r"C:\BotDiscord\ffmpeg\bin\ffmpeg.exe")
 print(f"[FFMPEG] Using executable: {FFMPEG_EXECUTABLE}")
 
 # yt-dlp executable
-YTDLP_EXECUTABLE = r"C:\BotDiscord\yt-dlp\yt-dlp.exe"
+YTDLP_EXECUTABLE = find_executable("yt-dlp", "yt-dlp", r"C:\BotDiscord\yt-dlp\yt-dlp.exe")
 print(f"[YTDLP] Using executable: {YTDLP_EXECUTABLE}")
 
 # Music cache directory

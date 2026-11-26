@@ -19,7 +19,7 @@ jobs:
       - name: Build exe
         run: >
           python -m PyInstaller --noconfirm --onefile --console --name Voorhees
-          --collect-data discord
+          --paths modules --hidden-import tts_piper --collect-data discord
           --collect-submodules yt_dlp
           --collect-all google.genai
           --collect-data gtts
