@@ -21,6 +21,9 @@ if getattr(sys, "frozen", False):
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 os.chdir(BASE_DIR)
+for _stream in (sys.stdout, sys.stderr):
+    if _stream and hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 _local_ffmpeg = os.path.join(BASE_DIR, "ffmpeg.exe")
 FFMPEG_EXE = _local_ffmpeg if os.path.exists(_local_ffmpeg) else "ffmpeg"
 load_dotenv(os.path.join(BASE_DIR, ".env"))
