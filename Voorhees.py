@@ -2970,7 +2970,10 @@ def extract_song_info(url: str) -> dict:
 
     query = url.strip()
     if not re.match(r"^https?://", query):
-        query = f"ytsearch1:{query}"
+        if re.match(r"^[\w.-]+\.[a-z]{2,}/\S*$", query, re.IGNORECASE):
+            query = f"https://{query}"
+        else:
+            query = f"ytsearch1:{query}"
 
     last_error = "unknown error"
     for extra in YTDLP_CLIENT_FALLBACKS:
