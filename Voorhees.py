@@ -3115,9 +3115,6 @@ async def checkstatus(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 if not BOT_TOKEN:
-    raise RuntimeError("Thiếu DISCORD_BOT_TOKEN trong file .env.")
-
-if not BOT_TOKEN:
     print(f"❌ Không tìm thấy DISCORD_BOT_TOKEN. Hãy đặt file .env cạnh bot: {BASE_DIR}")
     if getattr(sys, "frozen", False):
         input("Nhấn Enter để thoát...")
